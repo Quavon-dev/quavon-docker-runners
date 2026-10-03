@@ -374,11 +374,26 @@ def case_firewall_off_dialog():
 def case_isolation_must_hold():
     reset_host(flags=["leaky-firewall"])
     c = new_child()
-    drive(c, wizard() + [(r"Destroy the container", ENTER)])
+    drive(c, wizard() + [(r"does NOT block the LAN", "a" + ENTER), (r"Destroy the container", ENTER)], timeout=200)
     finish(c)
     out = transcript(c)
     check("Isolation check failed" in out and "REACHABLE" in out, "leaky firewall not detected")
+    check("Diagnostics:" in out, "diagnostics summary not shown")
     check("setup.sh docker" not in calls(), "continued installing despite failed isolation")
+
+
+def case_isolation_unverifiable_continue_without():
+    """Reporter's case: DNS works but TCP to github is blocked with the rules on."""
+    reset_host(flags=["no-internet"])
+    c = new_child()
+    drive(c, wizard() + [(r"cannot reach github.com:443", "l" + ENTER)], until=r"are online", timeout=240)
+    rc = finish(c)
+    out = transcript(c)
+    check(rc == 0, f"exit {rc}")
+    check("Continuing without network isolation for CT 100" in out, "skip not confirmed")
+    check(not os.path.exists("/etc/pve/firewall/100.fw"), "rules not removed after choosing to continue")
+    check("Isolation was SKIPPED for CT 100" in out, "summary must warn that isolation is off")
+    check("=== isolation diagnostics" in install_log(), "diagnostics not written to the log")
 
 
 def case_lan_mode_and_ephemeral():

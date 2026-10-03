@@ -766,29 +766,101 @@ setup_firewall() {
 probe() { pct exec "$CTID" -- bash -c 'timeout 4 bash -c "</dev/tcp/$1/$2"' _ "$1" "$2" 2>/dev/null; }
 
 check_isolation() {
-  sleep 12   # pve-firewall applies config changes within ~10s
-  local host_ip gw
+  local host_ip gw _
   host_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[0-9.]+' || true)"
   gw="$(pct exec "$CTID" -- ip -4 route show default | awk '{print $3; exit}')"
+  # pve-firewall applies rule changes every ~10 s: give it a few tries.
+  for _ in 1 2 3 4 5 6; do
+    probe github.com 443 && break
+    sleep 5
+  done
   probe github.com 443 || { echo "github.com:443 NOT reachable"; return 1; }
   echo "github.com:443 reachable"
-  if [[ -n "$host_ip" ]] && probe "$host_ip" 8006; then echo "Proxmox host ${host_ip}:8006 REACHABLE"; return 1; fi
+  if [[ -n "$host_ip" ]] && probe "$host_ip" 8006; then echo "Proxmox host ${host_ip}:8006 REACHABLE"; return 2; fi
   echo "Proxmox host ${host_ip:-?}:8006 blocked"
-  if [[ -n "$gw" ]] && probe "$gw" 80; then echo "gateway ${gw}:80 REACHABLE"; return 1; fi
+  if [[ -n "$gw" ]] && probe "$gw" 80; then echo "gateway ${gw}:80 REACHABLE"; return 2; fi
   echo "gateway ${gw:-?}:80 blocked"
   ISO_SUMMARY="github.com reachable; host ${host_ip:-?} and gateway ${gw:-?} blocked"
 }
 
+# Everything needed to understand a failed isolation check, into the log,
+# plus a short on-screen summary. Runs tolerant: a missing tool or an empty
+# grep must never abort the installer.
+isolation_diagnostics() {
+  ( set +e +o pipefail; trap - ERR; collect_isolation_diagnostics ) || true
+}
+
+collect_isolation_diagnostics() {
+  {
+    echo "=== isolation diagnostics for CT ${CTID}"
+    echo "--- host: pve-firewall status";   pve-firewall status 2>&1
+    echo "--- host: pve-firewall compile (errors/warnings)"
+    timeout 30 pve-firewall compile 2>&1 | grep -iE "error|warn|invalid|unable" | head -20
+    echo "--- host: /etc/pve/firewall/cluster.fw"; cat /etc/pve/firewall/cluster.fw 2>&1
+    echo "--- host: /etc/pve/firewall/${CTID}.fw"; cat "/etc/pve/firewall/${CTID}.fw" 2>&1
+    echo "--- host: net0";                   grep -E '^net0' "/etc/pve/lxc/${CTID}.conf" 2>&1
+    echo "--- host: iptables rules for this CT"
+    iptables-save 2>/dev/null | grep -E "veth${CTID}i0|PVEFW-${CTID}|lan_block|lan_allow" | head -40
+    echo "--- host: nftables rules for this CT"
+    nft list ruleset 2>/dev/null | grep -iE "veth${CTID}i0|${CTID}|lan_block" | head -40
+    echo "--- ct: addresses / routes / resolver"
+    pct exec "$CTID" -- ip -br addr 2>&1
+    pct exec "$CTID" -- ip route 2>&1
+    pct exec "$CTID" -- cat /etc/resolv.conf 2>&1
+    echo "--- ct: getent ahosts github.com"; pct exec "$CTID" -- getent ahosts github.com 2>&1 | head -4
+  } >>"$LOG_FILE" 2>&1
+
+  local gh_ip by_ip dns_ok=no
+  gh_ip="$(pct exec "$CTID" -- getent ahostsv4 github.com 2>/dev/null | awk 'NR==1 {print $1}')"
+  [[ -n "$gh_ip" ]] && dns_ok=yes
+  by_ip="$( { [[ -n "$gh_ip" ]] && probe "$gh_ip" 443 && echo yes; } || echo no)"
+  local cf; cf="$(probe 1.1.1.1 443 && echo yes || echo no)"
+  {
+    echo "--- ct: DNS works: ${dns_ok} (github.com -> ${gh_ip:-?})"
+    echo "--- ct: TCP ${gh_ip:-github}:443 by IP: ${by_ip}; TCP 1.1.1.1:443: ${cf}"
+  } >>"$LOG_FILE"
+  msg_warn "Diagnostics: DNS ${dns_ok}, TCP github:443 ${by_ip}, TCP 1.1.1.1:443 ${cf} - firewall: $(pve-firewall status 2>&1 | head -1)"
+  local errs; errs="$(timeout 30 pve-firewall compile 2>&1 | grep -iE "error|invalid|unable" | head -3 || true)"
+  [[ -n "$errs" ]] && msg_warn "pve-firewall reports: ${errs//$'\n'/ | }"
+}
+
+# Turn the isolation off for THIS container only (user's explicit choice);
+# further containers in a separate layout are still isolated and checked.
+NO_ISOLATION_CTS=()
+disable_isolation() {
+  rm -f "/etc/pve/firewall/${CTID}.fw"
+  NO_ISOLATION_CTS+=("$CTID")
+}
+
 verify_isolation() {
   [[ "$NET_ISOLATION" == internet ]] || return 0
-  ISO_SUMMARY=""
-  msg_info "Verifying network isolation"
-  if check_isolation >>"$LOG_FILE" 2>&1; then
-    msg_ok "Isolation verified: ${ISO_SUMMARY}"
-  else
+  local rc choice
+  while true; do
+    ISO_SUMMARY="" rc=0
+    msg_info "Verifying network isolation"
+    run check_isolation || rc=$?
+    if [[ "$rc" == 0 ]]; then msg_ok "Isolation verified: ${ISO_SUMMARY}"; return 0; fi
     msg_error "Isolation check failed: $(tail -n1 "$LOG_FILE")"
-    die "Check 'pve-firewall status' on the host. Nothing was installed in the container yet."
-  fi
+    isolation_diagnostics
+    [[ "$NONINTERACTIVE" == 1 ]] && die "Network isolation could not be verified (details in ${LOG_FILE}). Re-run with NET_ISOLATION=lan to skip it."
+    local what="The container cannot reach github.com:443 with the firewall rules active."
+    [[ "$rc" == 2 ]] && what="The firewall does NOT block the LAN: $(tail -n1 "$LOG_FILE")."
+    choice="$(w_menu "${what}
+
+Details (and the rules) are in ${LOG_FILE}.
+Nothing has been installed in the container yet." retry \
+      retry    "Check again" \
+      lan      "Continue WITHOUT isolation (jobs can reach your LAN)" \
+      abort    "Stop the installation")"
+    case "$choice" in
+      retry) continue ;;
+      lan)
+        disable_isolation
+        msg_warn "Continuing without network isolation for CT ${CTID}"
+        return 0 ;;
+      *) die "Stopped. Firewall details: ${LOG_FILE}" ;;
+    esac
+  done
 }
 
 wait_network() {
@@ -988,7 +1060,7 @@ ${rows}
       gha-runners list | add | remove <name> | logs <name> -f | limits | update
 
 ${YW}Security:${CL} jobs can use the Docker socket, i.e. they have root inside
-their LXC. $([[ $NET_ISOLATION == internet ]] && echo "The host firewall keeps them off your LAN." || echo "They can reach your whole LAN.")
+their LXC. $(if [[ $NET_ISOLATION != internet ]]; then echo "They can reach your whole LAN."; elif ((${#NO_ISOLATION_CTS[@]})); then echo "Isolation was SKIPPED for CT ${NO_ISOLATION_CTS[*]}: jobs there can reach your LAN."; else echo "The host firewall keeps them off your LAN."; fi)
 ${shared_note}
 Do not attach these runners to public repositories that accept
 pull requests from forks.
