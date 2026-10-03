@@ -2,7 +2,8 @@
 source "$(dirname "$0")/_common"; log "pveam $*"
 case "$1" in
   update) echo "update successful" ;;
-  available) printf 'system          debian-12-standard_12.12-1_amd64.tar.zst\nsystem          debian-13-standard_13.1-2_amd64.tar.zst\nsystem          ubuntu-24.04-standard_24.04-2_amd64.tar.zst\n' ;;
+  # Like the reporter's host: an arm64 build with a HIGHER version is listed too.
+  available) printf 'system          debian-12-standard_12.12-1_amd64.tar.zst\nsystem          debian-13-standard_13.1-2_amd64.tar.zst\nsystem          debian-13-standard_13.6-1_arm64.tar.zst\nsystem          ubuntu-24.04-standard_24.04-2_amd64.tar.zst\n' ;;
   list) echo "NAME                                                         SIZE"; if [[ -f "$S/template" ]]; then echo "local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst 123MB"; fi ;;
   download) sleep 0.3; touch "$S/template"; echo "download finished" ;;
 esac

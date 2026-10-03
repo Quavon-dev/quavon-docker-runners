@@ -630,11 +630,15 @@ Continue?" "$whiptail_height" 78 >&2 || exit_cancel
 }
 
 # ----------------------------------------------------------------- container --
+# Newest Debian 13 (else 12) standard template FOR THIS HOST'S ARCHITECTURE.
+# Template indexes can list several architectures (e.g. ..._arm64.tar.zst next
+# to ..._amd64.tar.zst); a foreign one fails with "Failed to spawn container".
 find_template() {
-  local available tmpl="" v
+  local available tmpl="" v arch
+  arch="$(dpkg --print-architecture)"
   available="$(pveam available --section system | awk '{print $2}')"
   for v in 13 12; do
-    tmpl="$(awk -v p="^debian-${v}-standard" '$0 ~ p' <<<"$available" | sort -V | tail -n1)"
+    tmpl="$(awk -v p="^debian-${v}-standard_.*_${arch}[.]tar[.]" '$0 ~ p' <<<"$available" | sort -V | tail -n1)"
     [[ -n "$tmpl" ]] && break
   done
   echo "$tmpl"
@@ -643,7 +647,7 @@ find_template() {
 ensure_template() {
   step "Updating LXC template list" "Updated LXC template list" -- bash -c 'pveam update || true'
   local tmpl; tmpl="$(find_template)"
-  [[ -n "$tmpl" ]] || die "No Debian 12/13 template available from pveam."
+  [[ -n "$tmpl" ]] || die "No Debian 12/13 $(dpkg --print-architecture) template available from pveam (check: pveam available --section system)."
   if grep -qF "$tmpl" <<<"$(pveam list "$TMPL_STORAGE")"; then
     msg_ok "Template ${tmpl} already present"
   else
