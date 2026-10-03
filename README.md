@@ -232,6 +232,28 @@ checkout is copied into the container and nothing is cloned.
   versions), the installer offers `lxc.apparmor.profile: unconfined`, but only
   after you confirm it.
 
+## Tests
+
+Everything runs in Docker on any machine. No Proxmox host is needed.
+
+```bash
+tests/run.sh         # shellcheck + unit tests + 17 end-to-end wizard runs
+tests/lxc/run.sh     # inside-the-LXC side for real: Docker, systemd units, image build, runner container
+```
+
+- **End-to-end tests** start `install.sh` exactly like the one-liner (`bash -c "$(…)"`) against a
+  fake Proxmox (`tests/fake-pve/`), and type into the real whiptail dialogs through a
+  pseudo-terminal. They cover:
+  - the normal path, the `separate` layout with static IPs and VLAN, LAN mode, and ephemeral mode
+  - invalid input, runner-name clashes, and a disabled datacenter firewall
+  - Docker or AppArmor failures, a leaky firewall, and no network
+  - Esc and Ctrl+C, a too-small terminal, a hanging `pvesh`, and non-interactive mode
+
+  They also check that no token ever appears in a command line or the log.
+- **LXC integration** boots Debian 13 with systemd and runs the real `setup.sh`,
+  `gha-runners`, systemd units and image build. With `GH_TEST_URL` and `GH_TEST_TOKEN`
+  set, it also registers a real runner.
+
 ## Layout
 
 ```text
@@ -244,4 +266,5 @@ image/Dockerfile           runner image (FLAVOR=standard|full)
 image/scripts/NN-*.sh      one build step per toolchain ("# flavors:" header)
 image/entrypoint.sh        ephemeral re-registration, env capture, run.sh
 image/hooks/               job-started / job-completed cleanup hooks
+tests/                     unit + end-to-end tests (fake Proxmox) and LXC integration test
 ```

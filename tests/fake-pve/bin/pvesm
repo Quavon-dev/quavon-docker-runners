@@ -1,0 +1,6 @@
+#!/bin/bash
+source "$(dirname "$0")/_common"; log "pvesm $*"
+printf 'Name             Type     Status           Total            Used       Available        %%\n'
+printf 'local-lvm     lvmthin     active       104857600        1048576       103809024    1.00%%\n'
+flag two-storages && printf 'tank          zfspool     active       209715200        1048576       208666624    0.50%%\n'
+exit 0

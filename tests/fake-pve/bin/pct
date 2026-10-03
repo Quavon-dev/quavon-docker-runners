@@ -1,0 +1,62 @@
+#!/bin/bash
+# Fake pct: records calls, keeps container state, simulates what runs inside.
+source "$(dirname "$0")/_common"
+log "pct $*"
+cmd="$1"; shift
+case "$cmd" in
+  create)
+    id="$1"; grep -qx "$id" "$S/ids" && { echo "CT $id already exists" >&2; exit 2; }
+    echo "$id" >>"$S/ids"; printf '%s\n' "$@" >"$S/ct-$id.create"; sleep 0.3 ;;
+  start|stop) sleep 0.2 ;;
+  destroy) sed -i "/^$1\$/d" "$S/ids"; echo "destroyed $1" >>"$S/destroyed" ;;
+  push) cp "$2" "$S/ct-$1-bootstrap" ;;
+  list) echo "VMID       Status     Lock         Name" ;;
+  status|config) exit 2 ;;
+  exec)
+    id="$1"; shift; [[ "$1" == -- ]] && shift
+    a="$*"
+    case "$a" in
+      *"_ github.com 443"*) flag no-internet && exit 1; exit 0 ;;
+      *"_ "*" 8006"*) flag leaky-firewall && exit 0; exit 1 ;;
+      *"_ "*" 80"*) exit 1 ;;
+      *"route show default"*) echo "default via 192.168.1.1 dev eth0 proto dhcp" ;;
+      *"hostname -I"*) echo "192.168.1.$((id % 200 + 20)) " ;;
+      "getent hosts github.com") flag no-network && exit 2; echo "140.82.121.4 github.com" ;;
+      *apt-get*) for p in ca-certificates curl git; do echo "Get:1 http://deb.debian.org/debian trixie/main amd64 $p"; sleep 0.2; echo "Setting up $p ..."; done ;;
+      *"git clone"*) echo "Cloning into '/opt/quavon-docker-runners'..." ;;
+      *"mkdir -p /opt"*) cat >/dev/null ;;
+      *"setup.sh docker"*)
+        echo "==> Installing Docker Engine"; sleep 0.5
+        if flag docker-fail; then echo "E: Unable to locate package docker-ce"; exit 100; fi
+        if flag apparmor && [[ ! -f "$S/apparmor-fixed" ]]; then
+          echo "==> Verifying Docker can run containers"; echo "permission denied: open sysctl net.ipv4.ip_unprivileged_port_start"
+          touch "$S/apparmor-fixed"; exit 3
+        fi
+        echo "==> Verifying Docker can run containers"; sleep 0.3; echo "Docker OK - storage driver: overlay2" ;;
+      *"docker --version"*) echo "Docker version 29.8.2, build abc1234" ;;
+      *"setup.sh register"*)
+        b="$S/ct-$id-bootstrap"; [[ -f "$b" ]] || { echo "bootstrap missing" >&2; exit 1; }
+        # shellcheck source=/dev/null
+        source "$b"
+        [[ -n "$GH_TOKEN$GH_PAT" ]] || { echo "no token in bootstrap" >&2; exit 1; }
+        have=$(wc -l <"$S/ct-$id-runners" 2>/dev/null || echo 0)
+        for ((i = have + 1; i <= RUNNER_COUNT; i++)); do
+          n="$RUNNER_PREFIX"; ((RUNNER_COUNT > 1)) && n="$RUNNER_PREFIX-$i"
+          echo "==> Configuring runner $n"; sleep 0.2
+          if flag clash-once && [[ ! -f "$S/clash-done" ]]; then
+            touch "$S/clash-done"; echo "A runner exists with the same name $n."; exit 4
+          fi
+          echo "√ Runner successfully added"; echo "$n" >>"$S/ct-$id-runners"
+        done ;;
+      *"ls /etc/gha-runners/runners/"*"paste"*) paste -sd, - <"$S/ct-$id-runners" ;;
+      *"ls /etc/gha-runners/runners/"*) cat "$S/ct-$id-runners" ;;
+      *"gha-runners build"*)
+        for st in 00-base 10-git 20-docker 30-python 31-node 40-cli 99-finalize; do echo "#9 0.4 ### step $st (standard)"; sleep 0.2; done
+        touch "$S/ct-$id-image" ;;
+      *"docker save"*) echo "IMAGE-TARBALL" ;;
+      *"docker load"*) cat >/dev/null; touch "$S/ct-$id-image" ;;
+      *"setup.sh start"*) [[ -f "$S/ct-$id-image" ]] || { echo "image missing in $id" >&2; exit 1; }; echo "started" ;;
+      *journalctl*) echo "√ Connected to GitHub"; echo "Listening for Jobs" ;;
+      *) sleep 0.1 ;;
+    esac ;;
+esac

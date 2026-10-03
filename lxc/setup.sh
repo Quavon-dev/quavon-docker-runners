@@ -93,7 +93,10 @@ setup_register() {
 
   # Re-runs (e.g. after a name clash) only add the runners still missing.
   local i name args have
-  have="$(find "${CONF_DIR}/runners" -name '*.env' 2>/dev/null | wc -l)"
+  have=0
+  if [[ -d "${CONF_DIR}/runners" ]]; then
+    have="$(find "${CONF_DIR}/runners" -name '*.env' | wc -l)"
+  fi
   for ((i = have + 1; i <= RUNNER_COUNT; i++)); do
     name="$RUNNER_PREFIX"; [[ "$RUNNER_COUNT" -gt 1 ]] && name="${RUNNER_PREFIX}-${i}"
     log "Configuring runner ${name}"

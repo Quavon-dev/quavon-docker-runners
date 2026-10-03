@@ -1,0 +1,9 @@
+#!/bin/bash
+source "$(dirname "$0")/_common"; log "pvesh $*"
+flag pvesh-hang && sleep 600
+if [[ "$1 $2" == "get /cluster/nextid" ]]; then
+  if [[ "${3:-}" == --vmid ]]; then grep -qx "$4" "$S/ids" && { echo "VM $4 already exists" >&2; exit 2; }; echo "$4"; exit 0; fi
+  id=100; while grep -qx "$id" "$S/ids"; do id=$((id + 1)); done; echo "$id"; exit 0
+fi
+[[ "$1" == set ]] && exit 0
+exit 0

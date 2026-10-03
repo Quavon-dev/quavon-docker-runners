@@ -1,0 +1,4 @@
+# Shared state for the fake Proxmox tools.
+S="${FAKE_STATE:-/tmp/fake-state}"; mkdir -p "$S"; touch "$S/ids"
+log() { printf '%s\n' "$*" >>"$S/calls"; }
+flag() { [[ -f "$S/flag.$1" ]]; }

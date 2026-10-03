@@ -13,7 +13,7 @@ REPO_URL="${REPO_URL:-https://github.com/quavon-dev/quavon-docker-runners.git}"
 REPO_BRANCH="${REPO_BRANCH:-main}"
 CT_REPO_DIR=/opt/quavon-docker-runners
 APP="GitHub Docker Runners"
-TITLE="Quavon ${APP}"
+TITLE="Quavon ${APP}   |   Esc = cancel"
 NONINTERACTIVE="${NONINTERACTIVE:-0}"
 
 # DEBUG=1 writes a full trace to /tmp/gha-install.log (dialogs stay usable).
@@ -33,6 +33,12 @@ LOG_FILE="${LOG_FILE:-/tmp/gha-runners-install-$(date +%Y%m%d-%H%M%S).log}"
 VERBOSE="${VERBOSE:-0}"
 SPINNER_PID="" STEP_TEXT="" STEP_START=0 STEP_LOG_LINE=0
 FANCY=0; [[ -t 1 && "$VERBOSE" != 1 ]] && FANCY=1
+# The real terminal, saved before any step redirects output into the log.
+# Exit/interrupt handlers switch back to it, otherwise their messages - and
+# the cleanup dialog - would land in the log file and the script would sit
+# waiting on an invisible prompt.
+exec {TTY_OUT}>&1 {TTY_ERR}>&2
+to_terminal() { exec 1>&"$TTY_OUT" 2>&"$TTY_ERR"; }
 
 fmt_elapsed() { printf '%d:%02d' $(($1 / 60)) $(($1 % 60)); }
 
@@ -96,9 +102,9 @@ run() {
   printf '\n### %s\n' "$*" >>"$LOG_FILE"
   STEP_LOG_LINE="$(wc -l <"$LOG_FILE")"
   if [[ "$VERBOSE" == 1 ]]; then
-    "$@" 2>&1 | tee -a "$LOG_FILE"
+    "$@" </dev/null 2>&1 | tee -a "$LOG_FILE"
   else
-    "$@" >>"$LOG_FILE" 2>&1
+    "$@" </dev/null >>"$LOG_FILE" 2>&1
   fi
 }
 
@@ -134,7 +140,9 @@ EOF
 # whiptail wrappers; in NONINTERACTIVE=1 mode they return the default.
 w_input() {   # w_input <text> <default>
   [[ "$NONINTERACTIVE" == 1 ]] && { echo "$2"; return; }
-  whiptail --backtitle "$TITLE" --title "$APP" --inputbox "$1" 12 78 "$2" 3>&1 1>&2 2>&3 || exit_cancel
+  # whiptail would parse a pre-filled value starting with '-' as an option
+  local init="$2"; [[ "$init" == -* ]] && init=""
+  whiptail --backtitle "$TITLE" --title "$APP" --inputbox "$1" 12 78 "$init" 3>&1 1>&2 2>&3 || exit_cancel
 }
 w_secret() {  # w_secret <text> <default>
   [[ "$NONINTERACTIVE" == 1 ]] && { echo "$2"; return; }
@@ -146,13 +154,15 @@ w_menu() {    # w_menu <text> <default> tag desc [tag desc ...]
   whiptail --backtitle "$TITLE" --title "$APP" --default-item "$def" \
     --menu "$text" 18 78 8 "$@" 3>&1 1>&2 2>&3 || exit_cancel
 }
-w_yesno() {   # w_yesno <text> [default-yes:1|0]
+w_yesno() {   # w_yesno <text> [default-yes:1|0]  (0 = Enter means "No")
   [[ "$NONINTERACTIVE" == 1 ]] && { [[ "${2:-1}" == 1 ]]; return; }
-  whiptail --backtitle "$TITLE" --title "$APP" --yesno "$1" 14 78
+  local def=(); [[ "${2:-1}" == 0 ]] && def=(--defaultno)
+  # >&2: draw on the terminal even when called inside $(...) (stdout captured)
+  whiptail --backtitle "$TITLE" --title "$APP" "${def[@]}" --yesno "$1" 14 78 >&2
 }
 w_msg() {     # w_msg <text> [height]
   [[ "$NONINTERACTIVE" == 1 ]] && return 0
-  whiptail --backtitle "$TITLE" --title "$APP" --msgbox "$1" "${2:-14}" 78
+  whiptail --backtitle "$TITLE" --title "$APP" --msgbox "$1" "${2:-14}" 78 >&2
 }
 exit_cancel() { clear 2>/dev/null || true; msg_error "Cancelled by user"; exit 130; }
 
@@ -179,13 +189,19 @@ BOOTSTRAP_TMP=""
 on_error() {
   local rc=$?
   [[ "$rc" == 130 ]] && return 0
+  # Only the main shell reports. A failure inside $(...) either reaches the
+  # main shell (and is reported there once) or is handled on purpose, e.g. in
+  # an `if` condition - printing "failed" for it would be a false alarm.
+  (( BASH_SUBSHELL == 0 )) || return 0
+  to_terminal
   msg_error "${STEP_TEXT:-Installer} failed (exit ${rc}, line $1)"
   show_log_tail
 }
 # Runs on every exit (die, ERR, signals): wipe secrets, offer to drop a broken CT.
 on_exit() {
   local rc=$?
-  trap - EXIT ERR
+  trap - EXIT ERR INT TERM HUP
+  to_terminal
   spinner_stop
   [[ "$FANCY" == 1 ]] && tput cnorm 2>/dev/null
   [[ "$rc" != 0 && "$rc" != 130 && -s "$LOG_FILE" ]] && msg_warn "Full log: ${LOG_FILE}"
@@ -205,15 +221,39 @@ on_exit() {
 }
 trap 'on_error $LINENO' ERR
 trap on_exit EXIT
+# Ctrl+C / kill always ends the installer (on_exit still cleans up). Without
+# this, bash may carry on with the next command after the child was killed.
+trap 'to_terminal; printf "\n"; msg_error "Interrupted"; exit 130' INT TERM HUP
 
 # ----------------------------------------------------------------- preflight --
+# Host commands get a timeout: a hung pmxcfs/pvesh must produce an error,
+# never a silent freeze.
+pve() {   # pve <seconds> <cmd...>
+  local secs="$1"; shift
+  # Plain timeout (not --foreground): kills the whole process group, so a hung
+  # child process can't keep $(...) waiting forever.
+  timeout -k 5 "${PVE_TIMEOUT:-$secs}" "$@" </dev/null || {
+    local rc=$?
+    [[ "$rc" == 124 ]] && die "'$*' did not answer within ${PVE_TIMEOUT:-$secs}s - is the Proxmox cluster filesystem (pve-cluster) healthy? Try: systemctl status pve-cluster"
+    return "$rc"
+  }
+}
+
 preflight() {
   [[ $EUID -eq 0 ]] || die "Run as root on the Proxmox VE host."
   command -v pveversion >/dev/null || die "This script must run on a Proxmox VE host."
-  for c in pct pveam pvesm pvesh whiptail; do command -v "$c" >/dev/null || die "missing command: $c"; done
+  local c
+  for c in pct pveam pvesm pvesh whiptail timeout; do command -v "$c" >/dev/null || die "missing command: $c"; done
   [[ "$(dpkg --print-architecture)" == amd64 ]] || die "Only amd64 Proxmox hosts are supported."
-  local major; major="$(pveversion | grep -oP 'pve-manager/\K[0-9]+')"
-  [[ "${major:-0}" -ge 8 ]] || die "Proxmox VE 8 or newer required (found: $(pveversion))."
+  local ver; ver="$(pve 20 pveversion | grep -oP 'pve-manager/\K[0-9.]+' || true)"
+  [[ "${ver%%.*}" =~ ^[0-9]+$ && "${ver%%.*}" -ge 8 ]] || die "Proxmox VE 8 or newer required (found: '${ver:-unknown}')."
+  if [[ "$NONINTERACTIVE" != 1 ]]; then
+    [[ -t 0 && -t 1 ]] || die "Needs an interactive terminal. Run it in a shell, or use NONINTERACTIVE=1 (see README)."
+    local rows cols
+    read -r rows cols < <(stty size 2>/dev/null || echo "24 80")
+    (( rows >= 24 && cols >= 80 )) || die "Terminal is ${cols}x${rows}; the dialogs need at least 80x24. Enlarge the window and retry."
+  fi
+  msg_ok "Proxmox VE ${ver} host, running as root"
 }
 
 # -------------------------------------------------------------- github input --
@@ -341,7 +381,7 @@ pick_storage() {   # pick_storage <content> <label>
     [[ -n "$name" ]] || continue
     first="${first:-$name}"
     items+=("$name" "$(printf '%-10s %6s GiB free' "$type" "$((avail / 1024 / 1024))")")
-  done < <(pvesm status -content "$content" 2>/dev/null | awk 'NR>1 && $3=="active"')
+  done < <(timeout 30 pvesm status -content "$content" 2>/dev/null | awk 'NR>1 && $3=="active"')
   [[ ${#items[@]} -gt 0 ]] || die "No active storage supports '${content}'."
   if [[ ${#items[@]} -eq 2 ]]; then echo "$first"; return; fi
   w_menu "Storage for ${label}" "$first" "${items[@]}"
@@ -349,11 +389,11 @@ pick_storage() {   # pick_storage <content> <label>
 
 # IDs come from Proxmox itself, exactly like the helper scripts: no scanning of
 # other guests. `pvesh get /cluster/nextid --vmid N` fails if N is taken.
-id_free() { pvesh get /cluster/nextid --vmid "$1" >/dev/null 2>&1; }
-next_id() { pvesh get /cluster/nextid; }
+id_free() { pve 20 pvesh get /cluster/nextid --vmid "$1" >/dev/null 2>&1; }
+next_id() { pve 20 pvesh get /cluster/nextid; }
 
 defaults() {
-  CTID="${CTID:-$(pvesh get /cluster/nextid)}"
+  CTID="${CTID:-$(next_id)}"
   CT_HOSTNAME="${CT_HOSTNAME:-gha-runners}"
   RUNNER_FLAVOR="${RUNNER_FLAVOR:-standard}"
   RUNNER_COUNT="${RUNNER_COUNT:-2}"
@@ -566,8 +606,11 @@ Continue anyway?" 0 || die "Choose a smaller size or fewer runners."
 confirm() {
   local mode=persistent; [[ "$RUNNER_EPHEMERAL" == 1 ]] && mode=ephemeral
   local i list="" n; n="$(ct_count)"
+  local id_txt range=""
+  (( $(runners_per_ct) > 1 )) && range="-1..$(runners_per_ct)"
   for ((i = 0; i < n; i++)); do
-    list+="    CT $([[ ${PLAN_IDS[$i]} == next ]] && echo "(next free)" || echo "${PLAN_IDS[$i]}")  ${PLAN_NAMES[$i]}  ${PLAN_IPS[$i]}  -> runner(s) ${PLAN_PREFIXES[$i]}$( [[ "$(runners_per_ct)" -gt 1 ]] && echo "-1..$(runners_per_ct)")
+    id_txt="${PLAN_IDS[$i]}"; [[ "$id_txt" == next ]] && id_txt="(next free)"
+    list+="    CT ${id_txt}  ${PLAN_NAMES[$i]}  ${PLAN_IPS[$i]}  -> runner(s) ${PLAN_PREFIXES[$i]}${range}
 "
   done
   local whiptail_height=$(( 22 + n ))
@@ -583,7 +626,7 @@ ${list}
   Mode        ${mode}, image ${RUNNER_FLAVOR}
   Labels      self-hosted,linux,x64${RUNNER_LABELS:+,${RUNNER_LABELS}}
 
-Continue?" "$whiptail_height" 78 || exit_cancel
+Continue?" "$whiptail_height" 78 >&2 || exit_cancel
 }
 
 # ----------------------------------------------------------------- container --
@@ -954,19 +997,19 @@ main() {
     exec gha-runners update
   fi
   header
+  printf ' %sLog: %s%s\n' "$DIM" "$LOG_FILE" "$CL"
   preflight
+  msg_info "Asking Proxmox for the next free container ID"
   defaults
+  msg_ok "Next free container ID: ${CTID}"
   w_yesno "This creates LXC container(s) with Docker and GitHub Actions runners.\n\nProceed?" 1 || exit_cancel
   ask_github
+  msg_ok "GitHub target: ${GH_URL}"
   ask_settings
   confirm
   header
   [[ "$FANCY" == 1 ]] && tput civis 2>/dev/null
-  printf ' %sLog: %s%s
-
-' "$DIM" "$LOG_FILE" "$CL"
-  printf ' %sPreparation%s
-' "$BL" "$CL"
+  printf ' %sLog: %s%s\n\n %sPreparation%s\n' "$DIM" "$LOG_FILE" "$CL" "$BL" "$CL"
   ensure_template
   local i
   for i in "${!PLAN_IDS[@]}"; do provision_ct "$i"; done

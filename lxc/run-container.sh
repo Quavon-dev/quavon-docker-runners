@@ -46,7 +46,13 @@ docker rm -f "gha-${name}" >/dev/null 2>&1 || true
 # --network host  : service containers / published ports reachable on localhost (like hosted)
 # same-path mount : job containers get valid host paths for _work and externals
 # --rm            : every restart starts from the pristine image
-exec docker run --rm --init \
+docker image inspect "$RUNNER_IMAGE" >/dev/null 2>&1 || {
+  echo "runner image $RUNNER_IMAGE not found - build it with: gha-runners build" >&2
+  sleep 30; exit 1
+}
+
+# --pull never: the image is always built locally, never fetched from a registry
+exec docker run --rm --init --pull never \
   --name "gha-${name}" \
   --network host \
   --user 1001:1001 \
