@@ -1,0 +1,379 @@
+#!/usr/bin/env bash
+# gha-runners - manage Dockerized GitHub Actions runners on this host.
+# Run `gha-runners help` for usage.
+set -Eeuo pipefail
+
+CONF_DIR=/etc/gha-runners
+RUNNERS_CONF="${CONF_DIR}/runners"
+RUNNERS_ROOT=/srv/gha-runners
+CACHE_DIR=/var/cache/gha-runners
+RUNNER_UID=1001
+NAME_RE='^[A-Za-z0-9._-]{1,64}$'
+
+c_ok=$'\e[32m' c_err=$'\e[31m' c_dim=$'\e[2m' c_off=$'\e[0m'
+info() { printf '%s\n' "$*"; }
+ok()   { printf '%s✔%s %s\n' "$c_ok" "$c_off" "$*"; }
+die()  { printf '%s✖ %s%s\n' "$c_err" "$*" "$c_off" >&2; exit 1; }
+
+require_root() { [[ $EUID -eq 0 ]] || die "run as root"; }
+
+load_config() {
+  [[ -f "${CONF_DIR}/config.env" ]] || die "not installed (${CONF_DIR}/config.env missing)"
+  # shellcheck source=/dev/null
+  source "${CONF_DIR}/config.env"
+}
+
+# KEY=VALUE files are shared with `docker --env-file`, so values stay unquoted.
+env_get() { sed -n "s/^$2=//p" "${RUNNERS_CONF}/$1.env" | head -n1; }
+
+runner_names() {
+  local f
+  for f in "${RUNNERS_CONF}"/*.env; do
+    [[ -e "$f" ]] || continue
+    f="${f##*/}"; echo "${f%.env}"
+  done
+}
+
+require_runner() {
+  [[ -f "${RUNNERS_CONF}/$1.env" ]] || die "unknown runner '$1' (see: gha-runners list)"
+}
+
+ask() {        # ask <prompt> [default]
+  local reply
+  read -r -p "$1${2:+ [$2]}: " reply </dev/tty
+  echo "${reply:-${2:-}}"
+}
+
+ask_secret() {
+  local reply
+  read -r -s -p "$1: " reply </dev/tty; echo >&2
+  echo "$reply"
+}
+
+# Accepts either a plain URL or GitHub's full "./config.sh --url X --token Y" line.
+# Prints "<url> <token>" (token may be empty).
+parse_pair_input() {
+  local input="$1" url="" token=""
+  if [[ "$input" =~ --url[[:space:]]+([^[:space:]]+) ]]; then url="${BASH_REMATCH[1]}"; fi
+  if [[ "$input" =~ --token[[:space:]]+([^[:space:]]+) ]]; then token="${BASH_REMATCH[1]}"; fi
+  [[ -z "$url" && "$input" =~ ^https:// ]] && url="${input%% *}"
+  echo "${url%/} ${token}"
+}
+
+valid_url() { [[ "$1" =~ ^https://[A-Za-z0-9.-]+/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)?$ ]]; }
+valid_token() { [[ "$1" =~ ^[A-Za-z0-9_]{16,255}$ ]]; }
+
+token_api() {  # token_api <github-url> <registration|remove>
+  local path host api
+  path="${1#https://}"; host="${path%%/*}"; path="${path#*/}"
+  if [[ "$host" == github.com ]]; then api="https://api.github.com"; else api="https://${host}/api/v3"; fi
+  case "$path" in
+    enterprises/*) echo "${api}/enterprises/${path#enterprises/}/actions/runners/$2-token" ;;
+    */*)           echo "${api}/repos/${path}/actions/runners/$2-token" ;;
+    *)             echo "${api}/orgs/${path}/actions/runners/$2-token" ;;
+  esac
+}
+
+pat_token() {  # pat_token <url> <pat> <registration|remove>
+  # Auth header comes from stdin so the PAT never shows up in `ps`.
+  curl -fsSL -X POST -H @- \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "$(token_api "$1" "$3")" <<<"Authorization: Bearer $2" | jq -r '.token // empty'
+}
+
+pat_file() { echo "${RUNNERS_CONF}/$1.pat"; }
+
+# config.sh reads ACTIONS_RUNNER_INPUT_TOKEN, keeping the token out of argv.
+runner_config() {  # runner_config <dir> <token> <config.sh args...>
+  local dir="$1" token="$2"; shift 2
+  (cd "$dir" && ACTIONS_RUNNER_INPUT_TOKEN="$token" runuser -u runner -- ./config.sh "$@")
+}
+
+runner_arch() {
+  case "$(dpkg --print-architecture)" in
+    amd64) echo x64 ;; arm64) echo arm64 ;; armhf) echo arm ;;
+    *) die "unsupported architecture" ;;
+  esac
+}
+
+latest_runner_version() {
+  local url
+  url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/actions/runner/releases/latest)"
+  [[ "$url" == */tag/v* ]] || die "cannot resolve latest actions/runner release"
+  echo "${url##*/tag/v}"
+}
+
+# Extract the official runner into <dir> (owned by the runner user).
+install_runner_binaries() {
+  local dir="$1" version arch tarball
+  version="$(latest_runner_version)"; arch="$(runner_arch)"
+  tarball="${CACHE_DIR}/actions-runner-linux-${arch}-${version}.tar.gz"
+  install -d "$CACHE_DIR"
+  if [[ ! -s "$tarball" ]]; then
+    info "Downloading actions/runner v${version} (${arch})"
+    curl -fsSL -o "${tarball}.part" \
+      "https://github.com/actions/runner/releases/download/v${version}/actions-runner-linux-${arch}-${version}.tar.gz"
+    mv "${tarball}.part" "$tarball"
+  fi
+  install -d -o "$RUNNER_UID" -g "$RUNNER_UID" "$dir"
+  tar -xzf "$tarball" -C "$dir"
+  chown -R "$RUNNER_UID:$RUNNER_UID" "$dir"
+}
+
+# The env file is handed to the container; the PAT is kept in a separate
+# root-only file that never enters the container.
+write_runner_env() {  # write_runner_env <name> <dir> <url> <labels> <group> <ephemeral> <pat>
+  local file="${RUNNERS_CONF}/$1.env"
+  install -d -m 0700 "$RUNNERS_CONF"
+  install -m 0600 /dev/null "$file"
+  {
+    echo "RUNNER_NAME=$1"
+    echo "RUNNER_DIR=$2"
+    echo "GITHUB_URL=$3"
+    echo "RUNNER_LABELS=$4"
+    echo "RUNNER_GROUP=$5"
+    echo "RUNNER_EPHEMERAL=$6"
+  } >"$file"
+  if [[ "$6" == 1 ]]; then
+    install -m 0600 /dev/null "$(pat_file "$1")"
+    printf '%s\n' "$7" >"$(pat_file "$1")"
+  fi
+}
+
+usage_add() {
+  cat <<'EOF'
+Usage: gha-runners add [options]
+  --name NAME         runner name (default: <hostname>-<n>)
+  --url URL           https://github.com/<org>[/<repo>] or .../enterprises/<ent>
+  --token TOKEN       registration token ("pair code" from GitHub > Settings >
+                      Actions > Runners > New self-hosted runner). Valid 1 hour.
+  --config "LINE"     paste GitHub's whole "./config.sh --url .. --token .." line
+  --labels L1,L2      extra labels (self-hosted, linux, x64 are always added)
+  --group GROUP       runner group (organisations/enterprises only)
+  --ephemeral         fresh container + re-registration after every job
+  --pat TOKEN         PAT for --ephemeral (repo: "Administration: write",
+                      org: "Self-hosted runners: write")
+  --no-start          register only, do not start the service
+EOF
+}
+
+cmd_add() {
+  require_root; load_config
+  # Secrets may come from the environment (used by setup.sh) instead of argv.
+  local name="" url="" token="${GHA_TOKEN:-}" labels="${DEFAULT_LABELS:-}" group="" ephemeral=0
+  local pat="${GHA_PAT:-}" start=1 pasted
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name) name="$2"; shift 2 ;;
+      --url) url="$2"; shift 2 ;;
+      --token) token="$2"; shift 2 ;;
+      --config) read -r url token <<<"$(parse_pair_input "$2")"; shift 2 ;;
+      --labels) labels="$2"; shift 2 ;;
+      --group) group="$2"; shift 2 ;;
+      --ephemeral) ephemeral=1; shift ;;
+      --pat) pat="$2"; shift 2 ;;
+      --no-start) start=0; shift ;;
+      -h|--help) usage_add; return 0 ;;
+      *) die "unknown option $1 (see: gha-runners add --help)" ;;
+    esac
+  done
+
+  if [[ -z "$url" ]]; then
+    pasted="$(ask "GitHub URL or pasted './config.sh --url .. --token ..' line")"
+    read -r url token <<<"$(parse_pair_input "$pasted")"
+  fi
+  valid_url "$url" || die "invalid GitHub URL: '$url'"
+
+  if [[ -z "$name" ]]; then
+    local n=1
+    while [[ -f "${RUNNERS_CONF}/$(hostname -s)-${n}.env" ]]; do n=$((n + 1)); done
+    name="$(ask "Runner name" "$(hostname -s)-${n}")"
+  fi
+  [[ "$name" =~ $NAME_RE ]] || die "invalid runner name '$name' (A-Z a-z 0-9 . _ -)"
+  [[ ! -f "${RUNNERS_CONF}/${name}.env" ]] || die "runner '$name' already exists"
+
+  if [[ "$ephemeral" == 1 ]]; then
+    [[ -n "$pat" ]] || pat="$(ask_secret "Personal access token (for ephemeral re-registration)")"
+    [[ -n "$(pat_token "$url" "$pat" registration 2>/dev/null)" ]] \
+      || die "PAT cannot create registration tokens for $url (check scopes)"
+  else
+    [[ -n "$token" ]] || token="$(ask_secret "Registration token (pair code)")"
+    valid_token "$token" || die "registration token looks invalid"
+  fi
+
+  local dir="${RUNNERS_ROOT}/${name}"
+  [[ ! -e "${dir}/.runner" ]] || die "${dir} already holds a registered runner"
+  install_runner_binaries "$dir"
+
+  if [[ "$ephemeral" == 0 ]]; then
+    info "Registering '${name}' with ${url}"
+    local args=(--unattended --replace --url "$url" --name "$name" --work _work)
+    [[ -n "$labels" ]] && args+=(--labels "$labels")
+    [[ -n "$group" ]] && args+=(--runnergroup "$group")
+    runner_config "$dir" "$token" "${args[@]}" \
+      || { rm -rf "$dir"; die "registration failed (token expired? tokens are valid for 1 hour)"; }
+  fi
+
+  write_runner_env "$name" "$dir" "$url" "$labels" "$group" "$ephemeral" "$pat"
+  ok "runner '${name}' configured ($([[ $ephemeral == 1 ]] && echo ephemeral || echo persistent))"
+
+  if [[ "$start" == 1 ]]; then
+    docker image inspect "$RUNNER_IMAGE" >/dev/null 2>&1 || cmd_build
+    systemctl enable --now "gha-runner@${name}.service"
+    ok "runner '${name}' started"
+  fi
+}
+
+cmd_remove() {
+  require_root; load_config
+  local name="" token=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --token) token="$2"; shift 2 ;;
+      -*) die "unknown option $1" ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  [[ -n "$name" ]] || die "usage: gha-runners remove <name> [--token REMOVAL_TOKEN]"
+  require_runner "$name"
+
+  local dir url pat
+  dir="$(env_get "$name" RUNNER_DIR)"; url="$(env_get "$name" GITHUB_URL)"
+  pat="$(cat "$(pat_file "$name")" 2>/dev/null || true)"
+
+  systemctl disable --now "gha-runner@${name}.service" 2>/dev/null || true
+
+  if [[ -f "${dir}/.runner" ]]; then
+    [[ -z "$token" && -n "$pat" ]] && token="$(pat_token "$url" "$pat" remove 2>/dev/null || true)"
+    if [[ -z "$token" && -t 0 ]]; then
+      info "${c_dim}GitHub > Settings > Actions > Runners > ${name} > Remove shows the removal token.${c_off}"
+      token="$(ask_secret "Removal token (empty = only delete locally)")"
+    fi
+    if [[ -n "$token" ]]; then
+      if runner_config "$dir" "$token" remove; then
+        ok "deregistered '${name}' from GitHub"
+      else
+        info "deregistration failed - remove '${name}' manually in GitHub"
+      fi
+    else
+      info "remember to delete the offline runner '${name}' in GitHub"
+    fi
+  fi
+
+  rm -rf -- "$dir" "${RUNNERS_CONF:?}/${name}.env" "$(pat_file "$name")"
+  ok "runner '${name}' removed locally"
+}
+
+cmd_list() {
+  load_config
+  local name state mode
+  printf '%-28s %-10s %-11s %-s\n' NAME STATE MODE URL
+  for name in $(runner_names); do
+    state="$(systemctl is-active "gha-runner@${name}.service" 2>/dev/null || true)"
+    mode=persistent; [[ "$(env_get "$name" RUNNER_EPHEMERAL)" == 1 ]] && mode=ephemeral
+    printf '%-28s %-10s %-11s %-s\n' "$name" "$state" "$mode" "$(env_get "$name" GITHUB_URL)"
+  done
+  printf '\n%simage: %s (%s)%s\n' "$c_dim" "$RUNNER_IMAGE" "$RUNNER_FLAVOR" "$c_off"
+}
+
+# Applies a systemctl verb to one runner or all.
+cmd_service() {
+  require_root
+  local verb="$1" target="${2:-all}" name
+  if [[ "$target" == all ]]; then
+    for name in $(runner_names); do systemctl "$verb" "gha-runner@${name}.service"; done
+  else
+    require_runner "$target"; systemctl "$verb" "gha-runner@${target}.service"
+  fi
+  ok "${verb}: ${target}"
+}
+
+cmd_logs() {
+  [[ -n "${1:-}" ]] || die "usage: gha-runners logs <name> [-f]"
+  require_runner "$1"
+  journalctl -u "gha-runner@$1.service" -n 200 --no-pager ${2:+"$2"}
+}
+
+cmd_shell() {
+  [[ -n "${1:-}" ]] || die "usage: gha-runners shell <name>"
+  docker exec -it "gha-$1" bash -l
+}
+
+cmd_build() {
+  require_root; load_config
+  local flavor="$RUNNER_FLAVOR" no_cache=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --flavor) flavor="$2"; shift 2 ;;
+      --no-cache) no_cache=(--no-cache); shift ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  [[ "$flavor" == standard || "$flavor" == full ]] || die "flavor must be 'standard' or 'full'"
+  local image="quavon/gha-runner:${flavor}"
+  info "Building ${image} - 'standard' takes ~5-10 min, 'full' ~20-40 min"
+  DOCKER_BUILDKIT=1 docker build "${no_cache[@]}" --pull --progress=plain \
+    --build-arg FLAVOR="$flavor" -t "$image" "${REPO_DIR}/image"
+  sed -i -e "s|^RUNNER_FLAVOR=.*|RUNNER_FLAVOR=${flavor}|" -e "s|^RUNNER_IMAGE=.*|RUNNER_IMAGE=${image}|" \
+    "${CONF_DIR}/config.env"
+  RUNNER_FLAVOR="$flavor" RUNNER_IMAGE="$image"
+  ok "image ${image} ready"
+}
+
+# Internal: used by run-container.sh to mint a 1-hour registration token on
+# the LXC side, so the long-lived PAT never enters the runner container.
+cmd_regtoken() {
+  require_root
+  local name="${1:?}" pat
+  require_runner "$name"
+  pat="$(cat "$(pat_file "$name")" 2>/dev/null)" || die "no PAT stored for '$name'"
+  pat_token "$(env_get "$name" GITHUB_URL)" "$pat" registration
+}
+
+cmd_update() {
+  require_root; load_config
+  [[ -d "${REPO_DIR}/.git" ]] || die "${REPO_DIR} is not a git checkout - re-run install.sh from a clone"
+  if [[ -t 0 ]]; then
+    [[ "$(ask "Restarting runners cancels running jobs. Continue? (y/N)" n)" =~ ^[Yy] ]] || die "aborted"
+  fi
+  info "Updating ${REPO_DIR}"
+  git -C "$REPO_DIR" pull --ff-only
+  bash "${REPO_DIR}/lxc/setup.sh" files
+  cmd_build
+  cmd_service restart all
+}
+
+usage() {
+  cat <<'EOF'
+gha-runners - Dockerized GitHub Actions runners
+
+  list                       show runners and their state
+  add [options]              register a new runner (see: add --help)
+  remove <name> [--token T]  deregister and delete a runner
+  start|stop|restart [name]  control one runner (default: all)
+  logs <name> [-f]           runner logs (journald)
+  shell <name>               open a shell inside a runner container
+  build [--flavor F] [--no-cache]  (re)build the runner image (standard|full)
+  update                     pull latest scripts, rebuild image, restart all
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    list|ls|status) cmd_list ;;
+    add) cmd_add "$@" ;;
+    remove|rm) cmd_remove "$@" ;;
+    start|stop|restart) cmd_service "$cmd" "${1:-all}" ;;
+    logs) cmd_logs "$@" ;;
+    shell) cmd_shell "$@" ;;
+    build) cmd_build "$@" ;;
+    update) cmd_update ;;
+    _regtoken) cmd_regtoken "$@" ;;
+    help|-h|--help) usage ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"

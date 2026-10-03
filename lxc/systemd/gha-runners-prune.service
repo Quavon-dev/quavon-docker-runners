@@ -1,0 +1,12 @@
+[Unit]
+Description=Prune stale Docker data left behind by GitHub Actions jobs
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/docker container prune --force --filter until=24h
+ExecStart=/usr/bin/docker network prune --force --filter until=24h
+ExecStart=/usr/bin/docker image prune --force --filter until=72h
+ExecStart=/usr/bin/docker volume prune --force
+ExecStart=/usr/bin/docker builder prune --force --filter until=72h
