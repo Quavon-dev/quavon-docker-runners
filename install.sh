@@ -770,6 +770,7 @@ check_isolation() {
   host_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[0-9.]+' || true)"
   gw="$(pct exec "$CTID" -- ip -4 route show default | awk '{print $3; exit}')"
   # pve-firewall applies rule changes every ~10 s: give it a few tries.
+  dns_still_ok || { echo "DNS lookups fail in the container (resolver: $(pct exec "$CTID" -- awk '/^nameserver/ {print $2}' /etc/resolv.conf | paste -sd' '))"; return 1; }
   for _ in 1 2 3 4 5 6; do
     probe github.com 443 && break
     sleep 5
@@ -795,7 +796,7 @@ collect_isolation_diagnostics() {
     echo "=== isolation diagnostics for CT ${CTID}"
     echo "--- host: pve-firewall status";   pve-firewall status 2>&1
     echo "--- host: pve-firewall compile (errors/warnings)"
-    timeout 30 pve-firewall compile 2>&1 | grep -iE "error|warn|invalid|unable" | head -20
+    timeout 30 pve-firewall compile 2>&1 | grep -vE '^[[:space:]]*-[AIN] ' | grep -iE "unable to|error|warn" | head -20
     echo "--- host: /etc/pve/firewall/cluster.fw"; cat /etc/pve/firewall/cluster.fw 2>&1
     echo "--- host: /etc/pve/firewall/${CTID}.fw"; cat "/etc/pve/firewall/${CTID}.fw" 2>&1
     echo "--- host: net0";                   grep -E '^net0' "/etc/pve/lxc/${CTID}.conf" 2>&1
@@ -820,7 +821,7 @@ collect_isolation_diagnostics() {
     echo "--- ct: TCP ${gh_ip:-github}:443 by IP: ${by_ip}; TCP 1.1.1.1:443: ${cf}"
   } >>"$LOG_FILE"
   msg_warn "Diagnostics: DNS ${dns_ok}, TCP github:443 ${by_ip}, TCP 1.1.1.1:443 ${cf} - firewall: $(pve-firewall status 2>&1 | head -1)"
-  local errs; errs="$(timeout 30 pve-firewall compile 2>&1 | grep -iE "error|invalid|unable" | head -3 || true)"
+  local errs; errs="$(timeout 30 pve-firewall compile 2>&1 | grep -vE '^[[:space:]]*-[AIN] ' | grep -iE "unable to|error|warning" | head -3 || true)"
   [[ -n "$errs" ]] && msg_warn "pve-firewall reports: ${errs//$'\n'/ | }"
 }
 
@@ -872,11 +873,50 @@ wait_network() {
   return 1
 }
 
+# Re-check DNS right before the isolation probes; re-pin once if a DHCP
+# client changed the resolver in the meantime.
+dns_still_ok() {
+  pct exec "$CTID" -- getent hosts github.com >/dev/null 2>&1 && return 0
+  [[ "$NET_ISOLATION" == internet ]] && pin_dns >/dev/null 2>&1
+  sleep 3
+  pct exec "$CTID" -- getent hosts github.com >/dev/null 2>&1
+}
+
 start_ct() {
   step "Starting container ${CTID}" "Started container ${CTID}" -- pct start "$CTID"
+  [[ "$NET_ISOLATION" == internet ]] && step "Pinning public DNS (${DNS_SERVERS})" "DNS pinned to ${DNS_SERVERS}" -- pin_dns
   msg_info "Waiting for network (DHCP + DNS)"
   wait_network || { msg_error "No network in container ${CTID}"; die "Check bridge, DHCP and VLAN."; }
   msg_ok "Network up: $(pct exec "$CTID" -- hostname -I | awk '{print $1}')"
+}
+
+# With isolation the LAN - including the router's DNS - is blocked. The
+# container's DHCP client would replace the public resolvers in
+# /etc/resolv.conf with the router's on every lease, breaking DNS a few
+# seconds after start. Tell every DHCP client flavour to keep our servers.
+pin_dns() {
+  local servers; read -ra servers <<<"$DNS_SERVERS"
+  pct exec "$CTID" -- bash -s -- "${servers[@]}" <<'PIN'
+set -e
+servers=("$@")
+printf 'nameserver %s\n' "${servers[@]}" >/etc/resolv.conf
+csv="$(IFS=,; echo "${servers[*]}")"
+if [[ -d /etc/dhcp ]]; then   # isc-dhcp-client (dhclient)
+  touch /etc/dhcp/dhclient.conf
+  sed -i '/^supersede domain-name-servers/d' /etc/dhcp/dhclient.conf
+  echo "supersede domain-name-servers ${csv//,/, };" >>/etc/dhcp/dhclient.conf
+fi
+if [[ -f /etc/dhcpcd.conf ]] || command -v dhcpcd >/dev/null 2>&1; then   # dhcpcd
+  touch /etc/dhcpcd.conf
+  grep -q '^nooption domain_name_servers' /etc/dhcpcd.conf || echo 'nooption domain_name_servers' >>/etc/dhcpcd.conf
+  grep -q '^static domain_name_servers' /etc/dhcpcd.conf || echo "static domain_name_servers=${servers[*]}" >>/etc/dhcpcd.conf
+fi
+if [[ -d /etc/systemd/network ]]; then   # systemd-networkd
+  mkdir -p /etc/systemd/network/eth0.network.d
+  printf '[DHCPv4]\nUseDNS=no\n[Network]\nDNS=%s\n' "${servers[*]}" >/etc/systemd/network/eth0.network.d/10-gha-dns.conf
+fi
+echo "resolv.conf now:"; cat /etc/resolv.conf
+PIN
 }
 
 # Copy the repo into the CT: local checkout if we run from one, else git clone.
