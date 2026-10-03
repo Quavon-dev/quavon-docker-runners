@@ -14,6 +14,14 @@ case "$cmd" in
   status|config) exit 2 ;;
   exec)
     id="$1"; shift; [[ "$1" == -- ]] && shift
+    # install.sh prefixes "env PATH=... LANG=... "; record it, then drop it
+    if [[ "$1" == env ]]; then
+      shift; envs=""
+      while [[ "$1" == *=* ]]; do envs+="$1 "; shift; done
+      echo "$envs" >"$S/last-ct-env"
+    else
+      echo "NO-ENV" >>"$S/ct-exec-without-env"
+    fi
     a="$*"
     case "$a" in
       *"_ github.com 443"*) flag no-internet && exit 1; exit 0 ;;

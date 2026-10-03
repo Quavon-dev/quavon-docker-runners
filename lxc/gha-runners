@@ -2,6 +2,10 @@
 # gha-runners - manage Dockerized GitHub Actions runners on this host.
 # Run `gha-runners help` for usage.
 set -Eeuo pipefail
+# Fixed environment: callers (pct exec, systemd, cron) may pass a minimal PATH
+# or a locale that is not installed in the container.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export LANG=C.UTF-8 LC_ALL=C.UTF-8 LANGUAGE=
 
 CONF_DIR=/etc/gha-runners
 RUNNERS_CONF="${CONF_DIR}/runners"

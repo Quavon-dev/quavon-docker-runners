@@ -7,6 +7,10 @@
 #   setup.sh start             build the image if missing, start all runners (phase 2)
 #   setup.sh install <envfile> both phases
 set -Eeuo pipefail
+# Fixed environment: callers (pct exec, systemd, cron) may pass a minimal PATH
+# or a locale that is not installed in the container.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export LANG=C.UTF-8 LC_ALL=C.UTF-8 LANGUAGE=
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 CONF_DIR=/etc/gha-runners
@@ -105,7 +109,7 @@ setup_register() {
     [[ "${RUNNER_EPHEMERAL:-0}" == 1 ]] && args+=(--ephemeral)
     # Secrets via env, not argv (keeps them out of `ps`).
     # exit 4 = name already taken in GitHub; install.sh asks for another name
-    GHA_TOKEN="${GH_TOKEN:-}" GHA_PAT="${GH_PAT:-}" gha-runners add "${args[@]}"
+    GHA_TOKEN="${GH_TOKEN:-}" GHA_PAT="${GH_PAT:-}" /usr/local/bin/gha-runners add "${args[@]}"
   done
 }
 
@@ -113,7 +117,7 @@ setup_register() {
 setup_start() {
   # shellcheck source=/dev/null
   source "${CONF_DIR}/config.env"
-  docker image inspect "$RUNNER_IMAGE" >/dev/null 2>&1 || gha-runners build --flavor "$RUNNER_FLAVOR"
+  docker image inspect "$RUNNER_IMAGE" >/dev/null 2>&1 || /usr/local/bin/gha-runners build --flavor "$RUNNER_FLAVOR"
   local f name
   for f in "${CONF_DIR}"/runners/*.env; do
     [[ -e "$f" ]] || continue
@@ -121,7 +125,7 @@ setup_start() {
     systemctl enable --now "gha-runner@${name}.service"
   done
   sleep 5
-  gha-runners list
+  /usr/local/bin/gha-runners list
 }
 
 case "${1:-}" in

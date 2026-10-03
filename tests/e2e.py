@@ -204,7 +204,10 @@ def case_happy_shared():
     check("RUNNER_COUNT=2" in boot and "RUNNER_CPUS=2" in boot and "RUNNER_MEM=4096" in boot, "bootstrap sizing wrong")
     check(read(f"{STATE}/ct-100-runners").split() == ["gha-runners-1", "gha-runners-2"], "runners not registered")
     check("git clone" in calls(), "curl-style run should git clone the repo")
-    check("pct exec 100 -- bash -s -- 1.1.1.1 9.9.9.9" in calls(), "public DNS not pinned against DHCP overwrite")
+    check("bash -s -- 1.1.1.1 9.9.9.9" in calls(), "public DNS not pinned against DHCP overwrite")
+    check(read(f"{STATE}/ct-exec-without-env") == "", "a container command ran without the fixed PATH/locale")
+    env_used = read(f"{STATE}/last-ct-env")
+    check("PATH=/usr/local/sbin:/usr/local/bin" in env_used and "LC_ALL=C.UTF-8" in env_used, f"container env wrong: {env_used}")
     check(re.search(r"pveam download \S+ debian-13-standard_13\.1-2_amd64\.tar\.zst", calls()) and "arm64" not in create,
           "must pick the template for the host architecture (amd64), not the newer arm64 one")
     assert_no_secret_leak()

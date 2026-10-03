@@ -630,6 +630,17 @@ Continue?" "$whiptail_height" 78 >&2 || exit_cancel
 }
 
 # ----------------------------------------------------------------- container --
+# Every command inside a container goes through ct(): `pct exec` passes the
+# host's environment along (e.g. LC_ALL=en_US.UTF-8, which the container has
+# no locale for -> perl/apt warnings) and does not reliably include
+# /usr/local/bin in PATH (-> "gha-runners: command not found").
+CT_ENV=(env PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        LANG=C.UTF-8 LC_ALL=C.UTF-8 LANGUAGE= DEBIAN_FRONTEND=noninteractive)
+ct() {   # ct <ctid> <cmd...>
+  local id="$1"; shift
+  pct exec "$id" -- "${CT_ENV[@]}" "$@"
+}
+
 # Newest Debian 13 (else 12) standard template FOR THIS HOST'S ARCHITECTURE.
 # Template indexes can list several architectures (e.g. ..._arm64.tar.zst next
 # to ..._amd64.tar.zst); a foreign one fails with "Failed to spawn container".
@@ -763,23 +774,51 @@ setup_firewall() {
 }
 
 # Prove it: GitHub must work, the Proxmox host (web UI port) and gateway must not.
-probe() { pct exec "$CTID" -- bash -c 'timeout 4 bash -c "</dev/tcp/$1/$2"' _ "$1" "$2" 2>/dev/null; }
+probe() { ct "$CTID" bash -c 'timeout 4 bash -c "</dev/tcp/$1/$2"' _ "$1" "$2" 2>/dev/null; }
+
+# pve-firewall only generates rules for running guests, on its ~10 s cycle.
+# Probing before the rules for this CT's NIC exist gives false "REACHABLE".
+wait_firewall_rules() {
+  local _
+  for _ in $(seq 1 20); do
+    if iptables-save 2>/dev/null | grep -q -- "veth${CTID}i0-OUT" \
+       || nft list ruleset 2>/dev/null | grep -q -- "veth${CTID}i0"; then
+      echo "firewall rules for veth${CTID}i0 are active"
+      sleep 2   # let the rest of the ruleset (ipsets) settle
+      return 0
+    fi
+    sleep 2
+  done
+  echo "rules for veth${CTID}i0 not visible after 40 s - probing anyway"
+}
+
+# probe_blocked <host> <port>: true once the target is unreachable; retries so
+# a ruleset that is still loading doesn't count as a leak.
+probe_blocked() {
+  local _
+  for _ in 1 2 3 4 5 6; do
+    probe "$1" "$2" || return 0
+    sleep 5
+  done
+  return 1
+}
 
 check_isolation() {
   local host_ip gw _
+  wait_firewall_rules
   host_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[0-9.]+' || true)"
-  gw="$(pct exec "$CTID" -- ip -4 route show default | awk '{print $3; exit}')"
+  gw="$(ct "$CTID" ip -4 route show default | awk '{print $3; exit}')"
   # pve-firewall applies rule changes every ~10 s: give it a few tries.
-  dns_still_ok || { echo "DNS lookups fail in the container (resolver: $(pct exec "$CTID" -- awk '/^nameserver/ {print $2}' /etc/resolv.conf | paste -sd' '))"; return 1; }
+  dns_still_ok || { echo "DNS lookups fail in the container (resolver: $(ct "$CTID" awk '/^nameserver/ {print $2}' /etc/resolv.conf | paste -sd' '))"; return 1; }
   for _ in 1 2 3 4 5 6; do
     probe github.com 443 && break
     sleep 5
   done
   probe github.com 443 || { echo "github.com:443 NOT reachable"; return 1; }
   echo "github.com:443 reachable"
-  if [[ -n "$host_ip" ]] && probe "$host_ip" 8006; then echo "Proxmox host ${host_ip}:8006 REACHABLE"; return 2; fi
+  if [[ -n "$host_ip" ]] && ! probe_blocked "$host_ip" 8006; then echo "Proxmox host ${host_ip}:8006 REACHABLE"; return 2; fi
   echo "Proxmox host ${host_ip:-?}:8006 blocked"
-  if [[ -n "$gw" ]] && probe "$gw" 80; then echo "gateway ${gw}:80 REACHABLE"; return 2; fi
+  if [[ -n "$gw" ]] && ! probe_blocked "$gw" 80; then echo "gateway ${gw}:80 REACHABLE"; return 2; fi
   echo "gateway ${gw:-?}:80 blocked"
   ISO_SUMMARY="github.com reachable; host ${host_ip:-?} and gateway ${gw:-?} blocked"
 }
@@ -805,14 +844,14 @@ collect_isolation_diagnostics() {
     echo "--- host: nftables rules for this CT"
     nft list ruleset 2>/dev/null | grep -iE "veth${CTID}i0|${CTID}|lan_block" | head -40
     echo "--- ct: addresses / routes / resolver"
-    pct exec "$CTID" -- ip -br addr 2>&1
-    pct exec "$CTID" -- ip route 2>&1
-    pct exec "$CTID" -- cat /etc/resolv.conf 2>&1
-    echo "--- ct: getent ahosts github.com"; pct exec "$CTID" -- getent ahosts github.com 2>&1 | head -4
+    ct "$CTID" ip -br addr 2>&1
+    ct "$CTID" ip route 2>&1
+    ct "$CTID" cat /etc/resolv.conf 2>&1
+    echo "--- ct: getent ahosts github.com"; ct "$CTID" getent ahosts github.com 2>&1 | head -4
   } >>"$LOG_FILE" 2>&1
 
   local gh_ip by_ip dns_ok=no
-  gh_ip="$(pct exec "$CTID" -- getent ahostsv4 github.com 2>/dev/null | awk 'NR==1 {print $1}')"
+  gh_ip="$(ct "$CTID" getent ahostsv4 github.com 2>/dev/null | awk 'NR==1 {print $1}')"
   [[ -n "$gh_ip" ]] && dns_ok=yes
   by_ip="$( { [[ -n "$gh_ip" ]] && probe "$gh_ip" 443 && echo yes; } || echo no)"
   local cf; cf="$(probe 1.1.1.1 443 && echo yes || echo no)"
@@ -867,7 +906,7 @@ Nothing has been installed in the container yet." retry \
 wait_network() {
   local _
   for _ in $(seq 1 60); do
-    pct exec "$CTID" -- getent hosts github.com >/dev/null 2>&1 && return 0
+    ct "$CTID" getent hosts github.com >/dev/null 2>&1 && return 0
     sleep 2
   done
   return 1
@@ -876,10 +915,10 @@ wait_network() {
 # Re-check DNS right before the isolation probes; re-pin once if a DHCP
 # client changed the resolver in the meantime.
 dns_still_ok() {
-  pct exec "$CTID" -- getent hosts github.com >/dev/null 2>&1 && return 0
+  ct "$CTID" getent hosts github.com >/dev/null 2>&1 && return 0
   [[ "$NET_ISOLATION" == internet ]] && pin_dns >/dev/null 2>&1
   sleep 3
-  pct exec "$CTID" -- getent hosts github.com >/dev/null 2>&1
+  ct "$CTID" getent hosts github.com >/dev/null 2>&1
 }
 
 start_ct() {
@@ -887,7 +926,7 @@ start_ct() {
   [[ "$NET_ISOLATION" == internet ]] && step "Pinning public DNS (${DNS_SERVERS})" "DNS pinned to ${DNS_SERVERS}" -- pin_dns
   msg_info "Waiting for network (DHCP + DNS)"
   wait_network || { msg_error "No network in container ${CTID}"; die "Check bridge, DHCP and VLAN."; }
-  msg_ok "Network up: $(pct exec "$CTID" -- hostname -I | awk '{print $1}')"
+  msg_ok "Network up: $(ct "$CTID" hostname -I | awk '{print $1}')"
 }
 
 # With isolation the LAN - including the router's DNS - is blocked. The
@@ -896,7 +935,7 @@ start_ct() {
 # seconds after start. Tell every DHCP client flavour to keep our servers.
 pin_dns() {
   local servers; read -ra servers <<<"$DNS_SERVERS"
-  pct exec "$CTID" -- bash -s -- "${servers[@]}" <<'PIN'
+  ct "$CTID" bash -s -- "${servers[@]}" <<'PIN'
 set -e
 servers=("$@")
 printf 'nameserver %s\n' "${servers[@]}" >/etc/resolv.conf
@@ -923,22 +962,22 @@ PIN
 deploy_repo() {
   step "Updating container OS packages" "Updated container OS packages" \
     --status '^(Get|Unpacking|Setting up)' \
-    -- pct exec "$CTID" -- bash -c 'export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get -y dist-upgrade && apt-get install -y git curl ca-certificates'
+    -- ct "$CTID" bash -c 'export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get -y dist-upgrade && apt-get install -y git curl ca-certificates'
   local src_dir
   src_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
   if [[ -n "$src_dir" && -f "${src_dir}/lxc/setup.sh" ]]; then
     step "Copying local checkout" "Deployed scripts from ${src_dir}" \
-      -- bash -c "tar -C '$src_dir' -czf - . | pct exec '$CTID' -- bash -c 'mkdir -p ${CT_REPO_DIR} && tar -xzf - -C ${CT_REPO_DIR}'"
+      -- bash -c "tar -C '$src_dir' -czf - . | pct exec '$CTID' -- ${CT_ENV[*]} bash -c 'mkdir -p ${CT_REPO_DIR} && tar -xzf - -C ${CT_REPO_DIR}'"
   else
     step "Downloading installer scripts" "Deployed scripts (${REPO_BRANCH})" \
-      -- pct exec "$CTID" -- git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$CT_REPO_DIR"
+      -- ct "$CTID" git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$CT_REPO_DIR"
   fi
 }
 
 install_docker() {
   local rc=0
   msg_info "Installing Docker" '^==> '
-  run pct exec "$CTID" -- bash "${CT_REPO_DIR}/lxc/setup.sh" docker || rc=$?
+  run ct "$CTID" bash "${CT_REPO_DIR}/lxc/setup.sh" docker || rc=$?
   if [[ "$rc" == 3 ]]; then
     msg_warn "Docker cannot start containers in this LXC (usually AppArmor on nested containers)"
     w_yesno "Docker could not run a test container.
@@ -953,9 +992,9 @@ Apply the fix and retry?" 1 || die "Docker not working - aborted."
     msg_ok "Applied AppArmor fix"
     start_ct
     step "Installing Docker (retry)" "Installed Docker" --status '^==> ' \
-      -- pct exec "$CTID" -- bash "${CT_REPO_DIR}/lxc/setup.sh" docker
+      -- ct "$CTID" bash "${CT_REPO_DIR}/lxc/setup.sh" docker
   elif [[ "$rc" == 0 ]]; then
-    msg_ok "Installed Docker ($(pct exec "$CTID" -- docker --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+'))"
+    msg_ok "Installed Docker ($(ct "$CTID" docker --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+'))"
   else
     msg_error "Installing Docker failed (exit ${rc})"
     show_log_tail
@@ -992,9 +1031,9 @@ register_runners() {   # uses CTID, CUR_PREFIX
     push_bootstrap
     msg_info "Registering runner(s) with GitHub" '^(==> |√|Runner successfully)'
     rc=0
-    run pct exec "$CTID" -- bash "${CT_REPO_DIR}/lxc/setup.sh" register /root/.gha-bootstrap.env || rc=$?
+    run ct "$CTID" bash "${CT_REPO_DIR}/lxc/setup.sh" register /root/.gha-bootstrap.env || rc=$?
     if [[ "$rc" == 0 ]]; then
-      msg_ok "Registered runner(s): $(pct exec "$CTID" -- bash -c 'ls /etc/gha-runners/runners/ | sed -n "s/\.env$//p" | paste -sd, -')"
+      msg_ok "Registered runner(s): $(ct "$CTID" bash -c 'ls /etc/gha-runners/runners/ | sed -n "s/\.env$//p" | paste -sd, -')"
       return 0
     fi
     if [[ "$rc" == 4 ]]; then   # setup.sh: name already exists in GitHub
@@ -1038,21 +1077,21 @@ finish_all() {
   printf '\n %sRunner image%s\n' "$BL" "$CL"
   step "Building '${RUNNER_FLAVOR}' image (standard ~5-10 min, full ~20-40 min)" \
     "Built runner image ${image}" --status '.*### step ' \
-    -- pct exec "$first" -- gha-runners build --flavor "$RUNNER_FLAVOR"
+    -- ct "$first" /usr/local/bin/gha-runners build --flavor "$RUNNER_FLAVOR"
   for id in "${PLAN_IDS[@]:1}"; do
     msg_info "Copying image to container ${id}"
-    if run bash -c "pct exec '$first' -- docker save '$image' | pct exec '$id' -- docker load"; then
+    if run bash -c "pct exec '$first' -- ${CT_ENV[*]} docker save '$image' | pct exec '$id' -- ${CT_ENV[*]} docker load"; then
       msg_ok "Copied image to container ${id}"
     else
       msg_warn "Copy to ${id} failed, building there instead"
       step "Building image in container ${id}" "Built image in container ${id}" --status '.*### step ' \
-        -- pct exec "$id" -- gha-runners build --flavor "$RUNNER_FLAVOR"
+        -- ct "$id" /usr/local/bin/gha-runners build --flavor "$RUNNER_FLAVOR"
     fi
   done
   printf '\n %sStarting%s\n' "$BL" "$CL"
   for id in "${PLAN_IDS[@]}"; do
     step "Starting runners in container ${id}" "Started runners in container ${id}" \
-      -- pct exec "$id" -- bash "${CT_REPO_DIR}/lxc/setup.sh" start
+      -- ct "$id" bash "${CT_REPO_DIR}/lxc/setup.sh" start
     wait_online "$id"
   done
 }
@@ -1060,26 +1099,26 @@ finish_all() {
 # The runner prints "Listening for Jobs" once it is connected to GitHub.
 wait_online() {   # wait_online <ctid>
   local id="$1" name names _ total online
-  names="$(pct exec "$id" -- bash -c 'ls /etc/gha-runners/runners/ | sed -n "s/\.env$//p"')"
+  names="$(ct "$id" bash -c 'ls /etc/gha-runners/runners/ | sed -n "s/\.env$//p"')"
   total="$(wc -w <<<"$names")"
   msg_info "Waiting for runner(s) in ${id} to connect to GitHub"
   for _ in $(seq 1 45); do
     online=0
     for name in $names; do
-      pct exec "$id" -- journalctl -u "gha-runner@${name}" --no-pager -n 200 2>/dev/null \
+      ct "$id" journalctl -u "gha-runner@${name}" --no-pager -n 200 2>/dev/null \
         | grep -q "Listening for Jobs" && online=$((online + 1))
     done
     if (( online == total )); then msg_ok "Online in GitHub: ${names//$'\n'/, }"; return 0; fi
     sleep 4
   done
-  msg_warn "${online}/${total} runner(s) online after 3 min - check: pct exec ${id} -- gha-runners logs <name>"
+  msg_warn "${online}/${total} runner(s) online after 3 min - check: pct exec ${id} -- /usr/local/bin/gha-runners logs <name>"
 }
 
 summary() {
   local i id ip rows=""
   for i in "${!PLAN_IDS[@]}"; do
     id="${PLAN_IDS[$i]}"
-    ip="$(pct exec "$id" -- hostname -I | awk '{print $1}')"
+    ip="$(ct "$id" hostname -I | awk '{print $1}')"
     rows+="    CT ${id}  ${PLAN_NAMES[$i]}  ${ip}
 "
   done

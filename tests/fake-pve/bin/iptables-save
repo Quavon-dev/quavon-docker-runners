@@ -1,0 +1,5 @@
+#!/bin/bash
+# Fake: pve-firewall has generated chains for every existing CT.
+source "$(dirname "$0")/_common"
+flag fw-rules-never && exit 0
+while read -r id; do [[ -n "$id" ]] && echo ":veth${id}i0-OUT - [0:0]"; done <"$S/ids"

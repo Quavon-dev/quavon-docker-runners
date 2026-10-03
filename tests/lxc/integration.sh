@@ -40,7 +40,13 @@ RUNNER_FLAVOR=standard
 RUNNER_CPUS=2
 RUNNER_MEM=2048
 B
-bash "$REPO/lxc/setup.sh" register /root/.gha-bootstrap.env >/tmp/register.log 2>&1; rc=$?
+# Same conditions as `pct exec` on the reporter's host: minimal PATH and the
+# host's locale (en_US.UTF-8, not installed in the container).
+env -i HOME=/root PATH=/usr/bin:/bin LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 \
+  bash "$REPO/lxc/setup.sh" register /root/.gha-bootstrap.env >/tmp/register.log 2>&1; rc=$?
+chk "gha-runners found despite minimal PATH" '! grep -q "command not found" /tmp/register.log'
+chk "no locale warnings" '! grep -qiE "setting locale failed|cannot set LC_" /tmp/register.log'
+chk "registration reached GitHub" 'grep -q "Http response code" /tmp/register.log'
 chk "invalid token -> non-zero exit (rc=$rc)" '[[ $rc != 0 && $rc != 4 ]]'
 chk "bootstrap with token deleted" '[[ ! -e /root/.gha-bootstrap.env ]]'
 chk "no half-registered runner dir left" '[[ ! -e /srv/gha-runners/itest-1/.runner && ! -d /srv/gha-runners/itest-1 ]]'
