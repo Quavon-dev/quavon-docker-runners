@@ -321,6 +321,31 @@ cmd_build() {
   ok "image ${image} ready"
 }
 
+# Change per-runner CPU/RAM caps for all runners and restart them.
+cmd_limits() {
+  require_root; load_config
+  local cpus="${RUNNER_CPUS:-}" mem="${RUNNER_MEM:-}"
+  if [[ $# -eq 0 ]]; then
+    info "per runner: cpus=${cpus:-unlimited} memory=${mem:-unlimited}${mem:+ MB}"
+    info "LXC total : $(nproc) CPUs, $(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo) MB (change on the host: pct set <CTID> --cores N --memory MB)"
+    return 0
+  fi
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --cpus) cpus="$2"; shift 2 ;;
+      --memory) mem="$2"; shift 2 ;;
+      *) die "usage: gha-runners limits [--cpus N] [--memory MB]  (0 = unlimited)" ;;
+    esac
+  done
+  cpus="${cpus:-0}" mem="${mem:-0}"
+  [[ "$cpus" =~ ^[0-9]+(\.[0-9]+)?$ && "$mem" =~ ^[0-9]+$ ]] || die "cpus and memory must be numbers"
+  [[ "$cpus" == 0 ]] && cpus=""; [[ "$mem" == 0 ]] && mem=""
+  sed -i -e "/^RUNNER_CPUS=/d" -e "/^RUNNER_MEM=/d" "${CONF_DIR}/config.env"
+  printf 'RUNNER_CPUS=%q\nRUNNER_MEM=%q\n' "$cpus" "$mem" >>"${CONF_DIR}/config.env"
+  ok "per-runner limits: cpus=${cpus:-unlimited} memory=${mem:-unlimited}"
+  cmd_service restart all
+}
+
 # Internal: used by run-container.sh to mint a 1-hour registration token on
 # the LXC side, so the long-lived PAT never enters the runner container.
 cmd_regtoken() {
@@ -355,6 +380,7 @@ gha-runners - Dockerized GitHub Actions runners
   logs <name> [-f]           runner logs (journald)
   shell <name>               open a shell inside a runner container
   build [--flavor F] [--no-cache]  (re)build the runner image (standard|full)
+  limits [--cpus N] [--memory MB]  show/change per-runner CPU/RAM caps
   update                     pull latest scripts, rebuild image, restart all
 EOF
 }
@@ -370,6 +396,7 @@ main() {
     shell) cmd_shell "$@" ;;
     build) cmd_build "$@" ;;
     update) cmd_update ;;
+    limits) cmd_limits "$@" ;;
     _regtoken) cmd_regtoken "$@" ;;
     help|-h|--help) usage ;;
     *) usage; exit 1 ;;

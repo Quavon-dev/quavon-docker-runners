@@ -64,12 +64,14 @@ ensure_runner_user() {
   apt-get install -y --no-install-recommends libicu-dev libkrb5-3 zlib1g >/dev/null
 }
 
-write_config() {   # write_config <flavor> <labels>
+write_config() {   # write_config <flavor> <labels> <cpus> <mem MB>
   {
     printf 'REPO_DIR=%q\n' "$REPO_DIR"
     printf 'RUNNER_FLAVOR=%q\n' "$1"
     printf 'RUNNER_IMAGE=%q\n' "quavon/gha-runner:$1"
     printf 'DEFAULT_LABELS=%q\n' "$2"
+    printf 'RUNNER_CPUS=%q\n' "${3:-}"
+    printf 'RUNNER_MEM=%q\n' "${4:-}"
   } >"${CONF_DIR}/config.env"
 }
 
@@ -84,7 +86,7 @@ setup_install() {
 
   setup_files
   ensure_runner_user
-  write_config "$RUNNER_FLAVOR" "${RUNNER_LABELS:-}"
+  write_config "$RUNNER_FLAVOR" "${RUNNER_LABELS:-}" "${RUNNER_CPUS:-}" "${RUNNER_MEM:-}"
 
   # Register first: registration tokens expire after 1 hour, the image build can take a while.
   local i name names=() args

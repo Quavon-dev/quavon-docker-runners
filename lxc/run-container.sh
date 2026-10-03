@@ -29,6 +29,18 @@ if [[ "$(sed -n 's/^RUNNER_EPHEMERAL=//p' "$env_file")" == 1 ]]; then
   token_env=(-e RUNNER_TOKEN)
 fi
 
+# Per-runner caps so one heavy job can't starve its siblings. (Containers a
+# job starts itself via the socket are bounded by the LXC limits instead.)
+# Only applied when the LXC delegates the needed cgroup controllers to Docker.
+limits=()
+read -r can_cpu can_mem <<<"$(docker info --format '{{.CPUCfsQuota}} {{.MemoryLimit}}' 2>/dev/null || echo false false)"
+if [[ -n "${RUNNER_CPUS:-}" ]]; then
+  if [[ "$can_cpu" == true ]]; then limits+=(--cpus "$RUNNER_CPUS"); else echo "warning: CPU limits unsupported here, skipping" >&2; fi
+fi
+if [[ -n "${RUNNER_MEM:-}" ]]; then
+  if [[ "$can_mem" == true ]]; then limits+=(--memory "${RUNNER_MEM}m" --memory-swap "${RUNNER_MEM}m"); else echo "warning: memory limits unsupported here, skipping" >&2; fi
+fi
+
 docker rm -f "gha-${name}" >/dev/null 2>&1 || true
 
 # --network host  : service containers / published ports reachable on localhost (like hosted)
@@ -40,6 +52,7 @@ exec docker run --rm --init \
   --user 1001:1001 \
   --group-add "$docker_gid" \
   --shm-size 2g \
+  "${limits[@]}" \
   --env-file "$env_file" \
   "${token_env[@]}" \
   -v /var/run/docker.sock:/var/run/docker.sock \

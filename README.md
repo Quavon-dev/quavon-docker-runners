@@ -17,9 +17,14 @@ The wizard asks for:
    before the image build so a slow build can't outlast the token.
 2. **Runner mode.** See [Persistent vs. ephemeral](#persistent-vs-ephemeral).
 3. **Image flavor** (`standard` or `full`).
-4. **Container settings.** `default` is 4 cores, 8 GB RAM, DHCP on `vmbr0`. `advanced` lets you
-   set the ID, hostname, resources, static IP, VLAN, SSH key and privileged mode.
-5. **Runner count, name, labels** and, for orgs or enterprises, a **runner group**.
+4. **Runner count and size per runner** (`small` / `medium` / `large` / `xlarge` / `custom`;
+   see [Sizing](#sizing)).
+5. **Network access.** `internet` (default) blocks the LAN, or `lan` leaves it open
+   (see [Network isolation](#network-isolation)).
+6. **Container settings.** `default` uses the computed sizing and DHCP on `vmbr0`. `advanced`
+   lets you set the ID, hostname, resources, static IP, VLAN, DNS, LAN exceptions, SSH key
+   and privileged mode.
+7. **Runner name, labels** and, for orgs or enterprises, a **runner group**.
 
 Then use it in a workflow:
 
@@ -34,6 +39,7 @@ jobs:
 | | |
 |---|---|
 | LXC | Debian 13 (falls back to 12), unprivileged, `nesting,keyctl,fuse`, starts on boot |
+| Network | internet only by default: LAN, Proxmox host and IPv6 blocked by the host firewall |
 | Runners | official `actions/runner`, auto-updating, one systemd service per runner |
 | Docker in jobs | `docker build/run`, `services:`, `container:` jobs, buildx, compose |
 | Networking | `--network host`, so `services:` ports work on `localhost` like on hosted runners |
@@ -53,6 +59,77 @@ jobs:
 | | AWS CLI v2, Azure CLI, Google Cloud CLI, ansible, kind |
 
 Change the flavor later with `gha-runners build --flavor full && gha-runners restart`.
+
+## Network isolation
+
+By default the container can reach **the internet only**. It cannot reach your LAN,
+the Proxmox host, your router, other VMs and containers, or anything over IPv6, and
+nothing can connect into it. Jobs still have full access to GitHub, package
+registries and Docker Hub.
+
+The rules are enforced by the **Proxmox firewall on the host**, on the container's
+network interface. Rules inside the container would be useless because jobs
+effectively have root there.
+
+| Rule | Effect |
+|---|---|
+| inbound policy `DROP` | no connections into the container (`pct enter` still works) |
+| `REJECT` to 10/8, 172.16/12, 192.168/16, 100.64/10, 169.254/16, multicast | LAN, CGNAT and link-local blocked |
+| `REJECT` to the Proxmox host's own IPs | host blocked even if it has public addresses |
+| `REJECT` all IPv6 | LAN devices with global IPv6 addresses can't be reached |
+| DNS via `1.1.1.1` / `9.9.9.9` | a LAN resolver isn't needed |
+| `ACCEPT` to `LAN_ALLOW` entries | opt-in exceptions, e.g. an internal registry or GitHub Enterprise Server |
+
+The installer checks that this works: `github.com` must be reachable, and the
+Proxmox web UI (`:8006`) and the gateway must not be. If either check fails, it aborts.
+
+**Datacenter firewall:** guest firewalls only apply when the datacenter firewall
+is on. If it's off, the installer asks before turning it on with input policy
+`ACCEPT`, so the host and other guests behave exactly as before. If the
+datacenter firewall is off but already has a `DROP` input policy configured, the
+installer warns you first, because turning it on could lock you out of the web UI or SSH.
+
+Rules live in `/etc/pve/firewall/<CTID>.fw` on the host. You can also view them in
+the UI under **CT → Firewall**. For even stronger separation, put the container on
+its own VLAN (advanced settings).
+
+## Sizing
+
+Choose a **per-runner size**. Each runner container is capped at that size, so
+one heavy job can't starve the others. The LXC totals are computed from the size
+and the runner count:
+
+| Preset | CPU / runner | RAM / runner | Job disk / runner | Good for |
+|---|---|---|---|---|
+| `small` | 1 | 2 GB | 4 GB | lint, unit tests, small builds |
+| `medium` (default) | 2 | 4 GB | 6 GB | typical web and app builds |
+| `large` | 4 | 8 GB | 10 GB | Docker image builds, big test suites |
+| `xlarge` | 8 | 16 GB | 20 GB | heavy compiles (Rust, C++, Android) |
+| `custom` | you choose | you choose | you choose | |
+
+LXC totals:
+- **CPU:** runners × CPU, capped at the host's cores.
+- **RAM:** runners × RAM, plus 1 GB for the OS.
+- **Disk:** 2 GB OS, plus the image (`standard` ~3 GB, `full` ~13 GB), plus runners × (1 GB + job disk).
+
+For example, 2 × `medium` with `standard` gives 4 cores, 9 GB RAM and 19 GB disk.
+In advanced mode you can override every total.
+
+CPU and RAM are **limits, not reservations**: an idle runner uses about 150 MB.
+On LVM-thin and ZFS the disk is thin-provisioned, so only data actually written
+takes space. Unused job images are pruned daily.
+
+Change limits later:
+
+```text
+gha-runners limits                          # show (inside the LXC)
+gha-runners limits --cpus 4 --memory 8192   # per-runner caps, restarts runners (0 = unlimited)
+pct set <CTID> --cores 8 --memory 16384     # LXC totals (on the Proxmox host)
+pct resize <CTID> rootfs +10G               # grow the disk (on the Proxmox host)
+```
+
+Containers that a job starts itself (`docker run`, `services:`) are bounded by the
+LXC totals, not by the per-runner cap.
 
 ## Persistent vs. ephemeral
 
@@ -74,6 +151,7 @@ gha-runners logs <name> -f              # live logs
 gha-runners restart [name]              # restart one or all
 gha-runners shell <name>                # shell inside a runner container
 gha-runners build [--flavor full]       # rebuild the image
+gha-runners limits [--cpus N --memory MB]  # per-runner CPU/RAM caps
 gha-runners update                      # pull latest scripts, rebuild, restart
 ```
 
@@ -86,12 +164,14 @@ Every prompt has an environment variable:
 ```bash
 NONINTERACTIVE=1 \
 GH_URL=https://github.com/my-org GH_TOKEN=AAAA... \
-RUNNER_COUNT=4 RUNNER_FLAVOR=full RUNNER_LABELS=docker,big \
-CTID=150 CORES=8 RAM=16384 DISK=150 \
+RUNNER_COUNT=4 SIZE=large RUNNER_FLAVOR=full RUNNER_LABELS=docker,big \
+CTID=150 \
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/quavon-dev/quavon-docker-runners/main/install.sh)"
 ```
 
-Other variables: `RUNNER_MODE=ephemeral` with `GH_PAT`, `RUNNER_PREFIX`, `RUNNER_GROUP`,
+Other variables: `SIZE=custom` with `RUNNER_CPUS` / `RUNNER_MEM`, `CORES` / `RAM` / `DISK`
+(override the totals), `NET_ISOLATION=internet|lan`, `DNS_SERVERS`, `LAN_ALLOW=10.0.0.5,10.0.10.0/24`,
+`RUNNER_MODE=ephemeral` with `GH_PAT`, `RUNNER_PREFIX`, `RUNNER_GROUP`,
 `CT_HOSTNAME`, `SWAP`, `BRIDGE`, `NET_IP` / `NET_GW`, `VLAN`, `SSH_KEYS`, `UNPRIVILEGED`,
 `REPO_URL` / `REPO_BRANCH` (forks).
 
@@ -101,9 +181,11 @@ checkout is copied into the container and nothing is cloned.
 ## Security
 
 > **Jobs can reach the LXC's Docker socket, which gives them root inside the
-> LXC.** This is the usual trade-off for self-hosted runners with Docker. Do not
-> attach these runners to **public** repositories that run workflows from fork
-> pull requests.
+> LXC.** This is the usual trade-off for self-hosted runners with Docker.
+> [Network isolation](#network-isolation) stops a compromised job from reaching
+> the rest of your network, but it can still use the internet. Do not attach
+> these runners to **public** repositories that run workflows from fork pull
+> requests.
 
 - Registration tokens are only passed to `config.sh` and are not saved (the bootstrap file is deleted).
 - Registration and removal tokens reach `config.sh` through the environment

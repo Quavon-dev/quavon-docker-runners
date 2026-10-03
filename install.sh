@@ -155,24 +155,79 @@ defaults() {
   RUNNER_COUNT="${RUNNER_COUNT:-2}"
   RUNNER_LABELS="${RUNNER_LABELS:-docker}"
   RUNNER_GROUP="${RUNNER_GROUP:-}"
-  CORES="${CORES:-4}"
-  RAM="${RAM:-8192}"
-  SWAP="${SWAP:-2048}"
   BRIDGE="${BRIDGE:-vmbr0}"
   NET_IP="${NET_IP:-dhcp}"
   NET_GW="${NET_GW:-}"
   VLAN="${VLAN:-}"
   UNPRIVILEGED="${UNPRIVILEGED:-1}"
   SSH_KEYS="${SSH_KEYS:-}"
+  NET_ISOLATION="${NET_ISOLATION:-internet}"
+  DNS_SERVERS="${DNS_SERVERS:-1.1.1.1 9.9.9.9}"
+  LAN_ALLOW="${LAN_ALLOW:-}"
 }
 
-flavor_disk() { [[ "$1" == full ]] && echo 100 || echo 40; }
+# Per-runner size presets: "<cpus> <ram MB> <job disk GB>".
+# Each runner container is capped at cpus/ram; the LXC gets the sum + 1 GB RAM
+# for the OS. Job disk = room for images/caches pulled by jobs (pruned daily).
+declare -A SIZE_PRESETS=(
+  [small]="1 2048 4"
+  [medium]="2 4096 6"
+  [large]="4 8192 10"
+  [xlarge]="8 16384 20"
+)
+
+host_cpus()   { nproc; }
+host_ram_mb() { awk '/MemTotal/ {print int($2 / 1024)}' /proc/meminfo; }
+
+ask_size() {
+  SIZE="$(w_menu "Resources per runner (each runner is capped at this; ${RUNNER_COUNT} runner(s))
+Host: $(host_cpus) CPUs, $(( $(host_ram_mb) / 1024 )) GB RAM" "${SIZE:-medium}" \
+    small  "1 CPU,  2 GB RAM  - lint, unit tests, small builds" \
+    medium "2 CPU,  4 GB RAM  - typical web/app builds (recommended)" \
+    large  "4 CPU,  8 GB RAM  - Docker image builds, big test suites" \
+    xlarge "8 CPU, 16 GB RAM  - heavy compiles (Rust, C++, Android)" \
+    custom "Set CPU and RAM per runner yourself")"
+
+  local job_disk
+  if [[ "$SIZE" == custom ]]; then
+    RUNNER_CPUS="$(w_input "CPU cores per runner" "${RUNNER_CPUS:-2}")"
+    RUNNER_MEM="$(w_input "RAM per runner in MB" "${RUNNER_MEM:-4096}")"
+    job_disk="$(w_input "Disk per runner for job images/caches in GB" "8")"
+  else
+    [[ -n "${SIZE_PRESETS[$SIZE]:-}" ]] || die "Unknown size '$SIZE' (small|medium|large|xlarge|custom)"
+    read -r RUNNER_CPUS RUNNER_MEM job_disk <<<"${SIZE_PRESETS[$SIZE]}"
+  fi
+  local n
+  for n in RUNNER_CPUS RUNNER_MEM job_disk; do
+    [[ "${!n}" =~ ^[0-9]+$ && "${!n}" -gt 0 ]] || die "$n must be a positive number"
+  done
+  size_defaults "$job_disk"
+}
+
+# LXC totals from the per-runner size. CPU/RAM are limits, not reservations,
+# and LVM-thin/ZFS disks are thin-provisioned, so unused headroom costs nothing.
+size_defaults() {   # size_defaults <job disk GB per runner>
+  local image_gb=3; [[ "$RUNNER_FLAVOR" == full ]] && image_gb=13
+  local cpus=$((RUNNER_COUNT * RUNNER_CPUS))
+  (( cpus > $(host_cpus) )) && cpus="$(host_cpus)"   # can't exceed host; runners share
+  CORES="${CORES:-$cpus}"
+  RAM="${RAM:-$((RUNNER_COUNT * RUNNER_MEM + 1024))}"
+  SWAP="${SWAP:-1024}"
+  DISK="${DISK:-$((2 + image_gb + RUNNER_COUNT * (1 + $1)))}"
+}
 
 ask_settings() {
   RUNNER_FLAVOR="$(w_menu "Runner image" "$RUNNER_FLAVOR" \
     standard "git, gh, Docker, Python, Node, build tools, kubectl, helm (~3 GB)" \
     full     "standard + Go, Java, .NET, Rust, PHP, Ruby, pwsh, browsers, clouds (~13 GB)")"
-  DISK="${DISK:-$(flavor_disk "$RUNNER_FLAVOR")}"
+  RUNNER_COUNT="$(w_input "How many runners (parallel jobs)?" "$RUNNER_COUNT")"
+  [[ "$RUNNER_COUNT" =~ ^[0-9]+$ && "$RUNNER_COUNT" -ge 1 && "$RUNNER_COUNT" -le 32 ]] \
+    || die "Runner count must be 1-32"
+  ask_size
+
+  NET_ISOLATION="$(w_menu "Network access for jobs" "$NET_ISOLATION" \
+    internet "Internet only: LAN, Proxmox host and other guests blocked (recommended)" \
+    lan      "No restrictions: jobs can reach your whole network")"
 
   local mode
   mode="$(w_menu "Container settings" default \
@@ -191,10 +246,14 @@ ask_settings() {
     [[ "$NET_IP" != dhcp ]] && NET_GW="$(w_input "IPv4 gateway" "$NET_GW")"
     VLAN="$(w_input "VLAN tag (empty = none)" "$VLAN")"
     SSH_KEYS="$(w_input "Path to SSH public key file for root (empty = none)" "$SSH_KEYS")"
+    if [[ "$NET_ISOLATION" == internet ]]; then
+      DNS_SERVERS="$(w_input "Public DNS servers for the container (space-separated)" "$DNS_SERVERS")"
+      LAN_ALLOW="$(w_input "LAN exceptions jobs MAY reach, e.g. an internal registry
+(comma-separated IPs/CIDRs, empty = none)" "$LAN_ALLOW")"
+    fi
     w_yesno "Unprivileged container? (recommended)" 1 && UNPRIVILEGED=1 || UNPRIVILEGED=0
   fi
 
-  RUNNER_COUNT="$(w_input "How many runners (parallel jobs)?" "$RUNNER_COUNT")"
   RUNNER_PREFIX="$(w_input "Runner name (suffix -1, -2, ... when more than one)" "${RUNNER_PREFIX:-$CT_HOSTNAME}")"
   RUNNER_LABELS="$(w_input "Extra labels, comma-separated (self-hosted,linux,x64 are automatic)" "$RUNNER_LABELS")"
   if [[ ! "$GH_URL" =~ ^https://[^/]+/[^/]+/[^/]+$ ]] || [[ "$GH_URL" == */enterprises/* ]]; then
@@ -213,10 +272,22 @@ validate_settings() {
   valid_name "$CT_HOSTNAME" || die "Invalid hostname: $CT_HOSTNAME"
   valid_name "$RUNNER_PREFIX" || die "Invalid runner name: $RUNNER_PREFIX"
   local n
-  for n in CORES RAM SWAP DISK RUNNER_COUNT; do
+  for n in CORES RAM SWAP DISK RUNNER_COUNT RUNNER_CPUS RUNNER_MEM; do
     [[ "${!n}" =~ ^[0-9]+$ ]] || die "$n must be a number"
   done
   [[ "$RUNNER_COUNT" -ge 1 && "$RUNNER_COUNT" -le 32 ]] || die "Runner count must be 1-32"
+  (( RAM <= $(host_ram_mb) )) || w_yesno "The container RAM limit (${RAM} MB) is above the host's RAM ($(host_ram_mb) MB).
+That works (it is only a limit), but parallel heavy jobs could make the host swap.
+
+Continue anyway?" 0 || die "Choose a smaller size or fewer runners."
+  [[ "$NET_ISOLATION" == internet || "$NET_ISOLATION" == lan ]] || die "NET_ISOLATION must be internet|lan"
+  [[ "$DNS_SERVERS" =~ ^[0-9a-fA-F.:\ ]+$ ]] || die "Invalid DNS servers: $DNS_SERVERS"
+  local d
+  for d in $DNS_SERVERS; do
+    is_private_ip "$d" && [[ "$NET_ISOLATION" == internet ]] \
+      && die "DNS server $d is a LAN address - use a public resolver or add it to LAN_ALLOW"
+  done
+  [[ -z "$LAN_ALLOW" || "$LAN_ALLOW" =~ ^[0-9a-fA-F.:/,]+$ ]] || die "Invalid LAN exceptions: $LAN_ALLOW"
   [[ "$RUNNER_LABELS" =~ ^[A-Za-z0-9._,-]*$ ]] || die "Labels may only contain A-Z a-z 0-9 . _ - ,"
   [[ "$NET_IP" == dhcp || "$NET_IP" =~ ^[0-9.]+/[0-9]+$ ]] || die "Invalid IPv4: $NET_IP"
   [[ -z "$VLAN" || "$VLAN" =~ ^[0-9]+$ ]] || die "Invalid VLAN tag: $VLAN"
@@ -230,9 +301,10 @@ confirm() {
 
   Container   ${CTID} (${CT_HOSTNAME}) $([[ $UNPRIVILEGED == 1 ]] && echo unprivileged || echo privileged)
   Resources   ${CORES} cores, ${RAM} MB RAM, ${DISK} GB on ${ROOT_STORAGE}
-  Network     ${BRIDGE} ${NET_IP}${VLAN:+ vlan ${VLAN}}
+  Network     ${BRIDGE} ${NET_IP}${VLAN:+ vlan ${VLAN}}, $([[ $NET_ISOLATION == internet ]] && echo "internet only${LAN_ALLOW:+ (+${LAN_ALLOW})}" || echo "full LAN access")
   GitHub      ${GH_URL}
   Runners     ${RUNNER_COUNT} x ${RUNNER_PREFIX} (${mode}, image: ${RUNNER_FLAVOR})
+  Per runner  ${RUNNER_CPUS} CPU, ${RUNNER_MEM} MB RAM (${SIZE})
   Labels      self-hosted,linux,x64${RUNNER_LABELS:+,${RUNNER_LABELS}}
 
 Continue?" 1 || exit_cancel
@@ -261,6 +333,7 @@ create_ct() {
   local net="name=eth0,bridge=${BRIDGE},ip=${NET_IP}"
   [[ -n "$NET_GW" ]] && net+=",gw=${NET_GW}"
   [[ -n "$VLAN" ]] && net+=",tag=${VLAN}"
+  [[ "$NET_ISOLATION" == internet ]] && net+=",firewall=1"
 
   local args=(
     --hostname "$CT_HOSTNAME"
@@ -279,11 +352,106 @@ Managed with \`gha-runners\` inside the container (\`pct enter ${CTID}\`).
 GitHub: ${GH_URL}"
   )
   [[ -n "$SSH_KEYS" ]] && args+=(--ssh-public-keys "$SSH_KEYS")
+  # Fixed public resolvers: a DHCP-provided LAN resolver would be blocked anyway.
+  [[ "$NET_ISOLATION" == internet ]] && args+=(--nameserver "$DNS_SERVERS")
 
   msg_info "Creating LXC ${CTID}"
   CT_CREATED=1   # set first: a half-finished create still gets cleaned up
   pct create "$CTID" "$TEMPLATE" "${args[@]}" >/dev/null
   msg_ok "Created LXC ${CTID}"
+}
+
+# ------------------------------------------------------------------ firewall --
+# Enforced by the Proxmox host on the CT's NIC. Rules inside the CT would be
+# useless: jobs control Docker there and therefore have root.
+# IPv6 is blocked entirely: LAN devices often have *global* IPv6 addresses
+# that no private range covers. Internet access works over IPv4.
+PRIVATE_NETS=(10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16
+              224.0.0.0/4 ::/1 8000::/1)   # ipset rejects /0: two halves = all IPv6
+
+is_private_ip() {
+  [[ "$1" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|169\.254\.|127\.) \
+     || "$1" =~ ^(fc|fd|fe80) ]]
+}
+
+# The datacenter-level switch must be on for any guest firewall to apply.
+ensure_cluster_firewall() {
+  local fw=/etc/pve/firewall/cluster.fw
+  if [[ -f "$fw" ]] && grep -qE '^enable:[[:space:]]*1' "$fw"; then
+    return 0
+  fi
+  if [[ -f "$fw" ]] && grep -qE '^policy_in:[[:space:]]*DROP' "$fw"; then
+    w_yesno "The datacenter firewall is OFF and its input policy is DROP.
+
+Turning it on would apply that DROP policy to the Proxmox host and could
+lock you out of the web UI/SSH. Enable it anyway?" 0 \
+      || die "Isolation needs the datacenter firewall. Enable it yourself, or re-run with NET_ISOLATION=lan."
+    pvesh set /cluster/firewall/options --enable 1 >/dev/null
+  else
+    w_yesno "Network isolation needs the Proxmox datacenter firewall, which is OFF.
+
+It will be enabled with input policy ACCEPT, so the host and all other
+guests keep working exactly as before. Only this container gets rules.
+
+Enable it?" 1 || die "Isolation needs the datacenter firewall (or re-run with NET_ISOLATION=lan)."
+    pvesh set /cluster/firewall/options --enable 1 --policy_in ACCEPT >/dev/null
+  fi
+  msg_ok "Datacenter firewall enabled"
+}
+
+write_ct_firewall() {
+  local fw="/etc/pve/firewall/${CTID}.fw" net item
+  {
+    echo "[OPTIONS]"
+    echo "enable: 1"
+    echo "policy_in: DROP"      # nothing may connect in (pct enter still works)
+    echo "policy_out: ACCEPT"   # internet allowed, LAN dropped by rules below
+    echo "dhcp: 1"
+    echo "ndp: 1"
+    echo "macfilter: 1"
+    echo
+    echo "[IPSET lan_block] # private, CGNAT, link-local, multicast"
+    for net in "${PRIVATE_NETS[@]}"; do echo "$net"; done
+    # The Proxmox host itself, even when it has public addresses.
+    for net in $(hostname -I); do echo "$net"; done
+    if [[ -n "$LAN_ALLOW" ]]; then
+      echo
+      echo "[IPSET lan_allow] # explicitly allowed LAN targets"
+      IFS=',' read -ra items <<<"$LAN_ALLOW"
+      for item in "${items[@]}"; do [[ -n "$item" ]] && echo "$item"; done
+    fi
+    echo
+    echo "[RULES]"
+    [[ -n "$LAN_ALLOW" ]] && echo "OUT ACCEPT -dest +lan_allow -log nolog"
+    # REJECT (not DROP): blocked connections fail instantly, no timeouts.
+    echo "OUT REJECT -dest +lan_block -log nolog"
+  } >"$fw"
+  msg_ok "Firewall: internet only${LAN_ALLOW:+, plus ${LAN_ALLOW}}"
+}
+
+setup_firewall() {
+  [[ "$NET_ISOLATION" == internet ]] || return 0
+  ensure_cluster_firewall
+  write_ct_firewall
+}
+
+# Prove it: GitHub must work, the Proxmox host (web UI port) must not.
+verify_isolation() {
+  [[ "$NET_ISOLATION" == internet ]] || return 0
+  local host_ip probe='timeout 4 bash -c "</dev/tcp/$1/$2" 2>/dev/null'
+  host_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[0-9.]+' || true)"
+  local gw; gw="$(pct exec "$CTID" -- ip -4 route show default | awk '{print $3; exit}')"
+  msg_info "Verifying network isolation"
+  sleep 12   # pve-firewall applies config changes within ~10s
+  pct exec "$CTID" -- bash -c "$probe" _ github.com 443 \
+    || die "Container cannot reach github.com:443 through the firewall."
+  if [[ -n "$host_ip" ]] && pct exec "$CTID" -- bash -c "$probe" _ "$host_ip" 8006; then
+    die "Isolation NOT effective: container reaches the Proxmox host ${host_ip}:8006. Check 'pve-firewall status'."
+  fi
+  if [[ -n "$gw" ]] && pct exec "$CTID" -- bash -c "$probe" _ "$gw" 80; then
+    die "Isolation NOT effective: container reaches its gateway ${gw}:80 (router UI)."
+  fi
+  msg_ok "Isolated: github.com reachable; Proxmox host ${host_ip:-?} and gateway ${gw:-?} blocked"
 }
 
 start_ct() {
@@ -347,6 +515,8 @@ install_runners() {
     printf 'RUNNER_LABELS=%q\n' "$RUNNER_LABELS"
     printf 'RUNNER_GROUP=%q\n' "$RUNNER_GROUP"
     printf 'RUNNER_FLAVOR=%q\n' "$RUNNER_FLAVOR"
+    printf 'RUNNER_CPUS=%q\n' "$RUNNER_CPUS"
+    printf 'RUNNER_MEM=%q\n' "$RUNNER_MEM"
   } >"$tmp"
   pct push "$CTID" "$tmp" /root/.gha-bootstrap.env --perms 600
   rm -f "$tmp"; BOOTSTRAP_TMP=""
@@ -371,7 +541,8 @@ ${GN}${APP} are online.${CL}
       gha-runners list | add | remove <name> | logs <name> -f | update
 
 ${YW}Security:${CL} jobs can use the Docker socket, i.e. they have root inside
-this LXC. Do not attach these runners to public repositories that accept
+this LXC. $([[ $NET_ISOLATION == internet ]] && echo "The host firewall keeps them off your LAN." || echo "They can reach your whole LAN.")
+Do not attach these runners to public repositories that accept
 pull requests from forks.
 EOF
 }
@@ -391,7 +562,9 @@ main() {
   header
   ensure_template
   create_ct
+  setup_firewall
   start_ct
+  verify_isolation
   deploy_repo
   install_docker
   install_runners
