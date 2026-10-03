@@ -16,6 +16,13 @@ APP="GitHub Docker Runners"
 TITLE="Quavon ${APP}"
 NONINTERACTIVE="${NONINTERACTIVE:-0}"
 
+# DEBUG=1 writes a full trace to /tmp/gha-install.log (dialogs stay usable).
+if [[ "${DEBUG:-0}" == 1 ]]; then
+  exec {GHA_TRACE_FD}>>/tmp/gha-install.log
+  BASH_XTRACEFD=$GHA_TRACE_FD
+  set -x
+fi
+
 # ---------------------------------------------------------------- ui helpers --
 YW=$'\e[33m' GN=$'\e[1;92m' RD=$'\e[01;31m' BL=$'\e[36m' DIM=$'\e[2m' CL=$'\e[m'
 msg_info()  { printf ' %s…%s %s\n' "$YW" "$CL" "$*"; }
@@ -253,7 +260,21 @@ pick_storage() {   # pick_storage <content> <label>
   w_menu "Storage for ${label}" "$first" "${items[@]}"
 }
 
-id_in_use() { pct status "$1" >/dev/null 2>&1 || qm status "$1" >/dev/null 2>&1; }
+# Guest configs are read straight from the cluster filesystem: `pct`/`qm` start
+# Perl (~0.5-1 s per call), which froze the wizard for a minute on busy hosts.
+PVE_NODES_DIR="${PVE_NODES_DIR:-/etc/pve/nodes}"
+
+ct_conf_files() { compgen -G "${PVE_NODES_DIR}/*/lxc/*.conf" || true; }
+
+id_in_use() {
+  compgen -G "${PVE_NODES_DIR}/*/lxc/$1.conf" >/dev/null \
+    || compgen -G "${PVE_NODES_DIR}/*/qemu-server/$1.conf" >/dev/null
+}
+
+# Value of <key> in the main section of a guest config (ignores snapshots).
+conf_get() {   # conf_get <file> <key>
+  awk -v k="$2:" '/^\[/ {exit} $1 == k {sub(/^[^:]+:[[:space:]]*/, ""); print; exit}' "$1"
+}
 
 next_free_id() {   # next_free_id <start>
   local id="$1"
@@ -263,18 +284,20 @@ next_free_id() {   # next_free_id <start>
 
 # Existing LXCs created by this installer (tagged github-runner): "<id> <hostname>"
 existing_runner_cts() {
-  local id
-  for id in $(pct list 2>/dev/null | awk 'NR>1 {print $1}'); do
-    pct config "$id" 2>/dev/null | grep -qE '^tags:.*github-runner' || continue
-    echo "$id $(pct config "$id" | awk '/^hostname:/ {print $2}')"
-  done
+  local f id
+  while read -r f; do
+    [[ -n "$f" ]] || continue
+    [[ "$(conf_get "$f" tags)" == *github-runner* ]] || continue
+    id="${f##*/}"; echo "${id%.conf} $(conf_get "$f" hostname)"
+  done < <(ct_conf_files)
 }
 
 all_ct_hostnames() {
-  local id
-  for id in $(pct list 2>/dev/null | awk 'NR>1 {print $1}'); do
-    pct config "$id" 2>/dev/null | awk '/^hostname:/ {print $2}'
-  done
+  local f
+  while read -r f; do
+    [[ -n "$f" ]] && conf_get "$f" hostname
+  done < <(ct_conf_files)
+  return 0
 }
 
 # First of gha-runners, gha-runners-2, ... not used by any container on this host.
@@ -544,7 +567,7 @@ ${list}
   Mode        ${mode}, image ${RUNNER_FLAVOR}
   Labels      self-hosted,linux,x64${RUNNER_LABELS:+,${RUNNER_LABELS}}
 
-Continue?" "$whiptail_height" 90 || exit_cancel
+Continue?" "$whiptail_height" 78 || exit_cancel
 }
 
 # ----------------------------------------------------------------- container --
@@ -838,6 +861,7 @@ main() {
   preflight
   defaults
   w_yesno "This creates LXC container(s) with Docker and GitHub Actions runners.\n\nProceed?" 1 || exit_cancel
+  msg_info "Checking existing containers"
   check_existing
   ask_github
   ask_settings
