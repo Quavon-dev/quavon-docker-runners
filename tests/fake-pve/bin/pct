@@ -58,6 +58,8 @@ case "$cmd" in
         done ;;
       *"ls /etc/gha-runners/runners/"*"paste"*) paste -sd, - <"$S/ct-$id-runners" ;;
       *"ls /etc/gha-runners/runners/"*) cat "$S/ct-$id-runners" ;;
+      *"gha-runners build --flavor full"*)
+        echo "#20 6.082  liboss4-salsa-asound2 : Conflicts: libasound2"; exit 1 ;;
       *"gha-runners build"*)
         for st in 00-base 10-git 20-docker 30-python 31-node 40-cli 99-finalize; do echo "#9 0.4 ### step $st (standard)"; sleep 0.2; done
         touch "$S/ct-$id-image" ;;

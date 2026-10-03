@@ -185,6 +185,7 @@ ${hint}" 16
 
 # ------------------------------------------------------------- error cleanup --
 CREATED_CTS=()
+REGISTERED_RUNNERS=()
 BOOTSTRAP_TMP=""
 on_error() {
   local rc=$?
@@ -213,6 +214,10 @@ on_exit() {
         pct stop "$id" >/dev/null 2>&1 || true
         pct destroy "$id" --purge >/dev/null 2>&1 && msg_ok "Destroyed container ${id}"
       done
+      if ((${#REGISTERED_RUNNERS[@]})); then
+        msg_warn "Already registered in GitHub (now offline): ${REGISTERED_RUNNERS[*]}"
+        msg_warn "Remove them under ${GH_URL}/settings/actions/runners - a re-run with the same name would clash"
+      fi
     else
       msg_warn "Kept for debugging: ${CREATED_CTS[*]} (pct enter <id>)"
     fi
@@ -1033,7 +1038,10 @@ register_runners() {   # uses CTID, CUR_PREFIX
     rc=0
     run ct "$CTID" bash "${CT_REPO_DIR}/lxc/setup.sh" register /root/.gha-bootstrap.env || rc=$?
     if [[ "$rc" == 0 ]]; then
-      msg_ok "Registered runner(s): $(ct "$CTID" bash -c 'ls /etc/gha-runners/runners/ | sed -n "s/\.env$//p" | paste -sd, -')"
+      local names; names="$(ct "$CTID" bash -c 'ls /etc/gha-runners/runners/ | sed -n "s/\.env$//p" | paste -sd, -')"
+      local -a list; IFS=, read -ra list <<<"$names"
+      REGISTERED_RUNNERS+=("${list[@]}")
+      msg_ok "Registered runner(s): ${names}"
       return 0
     fi
     if [[ "$rc" == 4 ]]; then   # setup.sh: name already exists in GitHub
@@ -1071,13 +1079,38 @@ provision_ct() {   # provision_ct <index>
   register_runners
 }
 
+# The containers and the GitHub registration are fine at this point, so a
+# failed build must not throw them away: offer retry / standard / stop.
+build_image() {   # build_image <ctid>
+  local id="$1" rc choice
+  while true; do
+    msg_info "Building '${RUNNER_FLAVOR}' image (standard ~5-10 min, full ~20-40 min)" '.*### step '
+    rc=0
+    run ct "$id" /usr/local/bin/gha-runners build --flavor "$RUNNER_FLAVOR" || rc=$?
+    if [[ "$rc" == 0 ]]; then msg_ok "Built runner image quavon/gha-runner:${RUNNER_FLAVOR}"; return 0; fi
+    msg_error "Building '${RUNNER_FLAVOR}' image failed (exit ${rc})"
+    show_log_tail
+    [[ "$NONINTERACTIVE" == 1 ]] && exit "$rc"
+    local alt=()
+    [[ "$RUNNER_FLAVOR" == full ]] && alt=(standard "Use the 'standard' image instead (switch to full later: gha-runners build --flavor full)")
+    choice="$(w_menu "The runner image could not be built (output above / in ${LOG_FILE}).
+
+Container(s) and GitHub registration are fine." retry \
+      retry "Try the build again" "${alt[@]}" stop "Stop the installation")"
+    case "$choice" in
+      retry) continue ;;
+      standard) RUNNER_FLAVOR=standard ;;
+      *) exit "$rc" ;;
+    esac
+  done
+}
+
 # Phase 2: build the image once, copy it to the other containers, start all.
 finish_all() {
   local image="quavon/gha-runner:${RUNNER_FLAVOR}" first="${PLAN_IDS[0]}" id
   printf '\n %sRunner image%s\n' "$BL" "$CL"
-  step "Building '${RUNNER_FLAVOR}' image (standard ~5-10 min, full ~20-40 min)" \
-    "Built runner image ${image}" --status '.*### step ' \
-    -- ct "$first" /usr/local/bin/gha-runners build --flavor "$RUNNER_FLAVOR"
+  build_image "$first"
+  image="quavon/gha-runner:${RUNNER_FLAVOR}"   # may have changed to standard
   for id in "${PLAN_IDS[@]:1}"; do
     msg_info "Copying image to container ${id}"
     if run bash -c "pct exec '$first' -- ${CT_ENV[*]} docker save '$image' | pct exec '$id' -- ${CT_ENV[*]} docker load"; then

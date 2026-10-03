@@ -11,7 +11,10 @@ fi
 log "Google Chrome"
 add_apt_repo google-chrome https://dl.google.com/linux/linux_signing_key.pub \
   "https://dl.google.com/linux/chrome/deb/ stable main"
-apt_install google-chrome-stable
+# Chrome depends on the virtual "libasound2". On Ubuntu 24.04 apt may pick the
+# provider liboss4-salsa-asound2, which conflicts ("pkgProblemResolver ...
+# generated breaks"). Name the real provider explicitly.
+apt_install libasound2t64 google-chrome-stable
 
 log "chromedriver (matching Chrome)"
 chrome_version="$(google-chrome --version | grep -oE '[0-9]+(\.[0-9]+){3}')"
@@ -30,7 +33,7 @@ log "Firefox (Mozilla apt repo, not snap)"
 add_apt_repo mozilla https://packages.mozilla.org/apt/repo-signing-key.gpg \
   "https://packages.mozilla.org/apt mozilla main"
 printf 'Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n' >/etc/apt/preferences.d/mozilla
-apt_install firefox
+apt_install libasound2t64 firefox
 
 log "geckodriver"
 tag="$(gh_latest_tag mozilla/geckodriver)"

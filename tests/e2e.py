@@ -449,6 +449,33 @@ def case_local_checkout_is_copied():
     check("git clone" not in calls() and "Deployed scripts from /src" in transcript(child), "local checkout not used")
 
 
+def case_full_build_fails_fallback_to_standard():
+    reset_host()
+    c = new_child()
+    answers = [(p, ("\x1b[B" + ENTER) if p == r"Runner image" else k) for p, k in wizard()]   # pick "full"
+    answers.append((r"runner image could not be built", "s" + ENTER))                        # -> standard
+    drive(c, answers, until=r"are online", timeout=200)
+    rc = finish(c)
+    out = transcript(c)
+    check(rc == 0, f"exit {rc}")
+    check("Building 'full' image failed" in out and "liboss4-salsa-asound2" in out, "build failure not shown")
+    check("Built runner image quavon/gha-runner:standard" in out, "fallback to standard not used")
+    check(read(f"{STATE}/destroyed") == "", "container must be kept when falling back")
+
+
+def case_destroy_mentions_registered_runners():
+    reset_host()
+    c = new_child()
+    answers = [(p, ("\x1b[B" + ENTER) if p == r"Runner image" else k) for p, k in wizard()]
+    answers += [(r"runner image could not be built", "\x1b[B\x1b[B" + ENTER),                 # stop
+                (r"Destroy the container", "\t" + ENTER)]
+    drive(c, answers, timeout=200)
+    finish(c)
+    out = transcript(c)
+    check("Already registered in GitHub (now offline): gha-runners-1 gha-runners-2" in out, "ghost runners not reported")
+    check("settings/actions/runners" in out, "no hint where to remove them")
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("case_")]
 
 if __name__ == "__main__":
