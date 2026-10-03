@@ -17,14 +17,16 @@ The wizard asks for:
    before the image build so a slow build can't outlast the token.
 2. **Runner mode.** See [Persistent vs. ephemeral](#persistent-vs-ephemeral).
 3. **Image flavor** (`standard` or `full`).
-4. **Runner count and size per runner** (`small` / `medium` / `large` / `xlarge` / `custom`;
+4. **Parallel jobs.** How many runners you want, and whether they share one LXC
+   or each get their own (see [Parallel jobs](#parallel-jobs)).
+5. **Size per runner** (`small` / `medium` / `large` / `xlarge` / `custom`;
    see [Sizing](#sizing)).
-5. **Network access.** `internet` (default) blocks the LAN, or `lan` leaves it open
+6. **Network access.** `internet` (default) blocks the LAN, or `lan` leaves it open
    (see [Network isolation](#network-isolation)).
-6. **Container settings.** `default` uses the computed sizing and DHCP on `vmbr0`. `advanced`
+7. **Container settings.** `default` uses the computed sizing and DHCP on `vmbr0`. `advanced`
    lets you set the ID, hostname, resources, static IP, VLAN, DNS, LAN exceptions, SSH key
    and privileged mode.
-7. **Runner name, labels** and, for orgs or enterprises, a **runner group**.
+8. **Runner name, labels** and, for orgs or enterprises, a **runner group**.
 
 Then use it in a workflow:
 
@@ -59,6 +61,30 @@ jobs:
 | | AWS CLI v2, Azure CLI, Google Cloud CLI, ansible, kind |
 
 Change the flavor later with `gha-runners build --flavor full && gha-runners restart`.
+
+Invalid input never aborts the wizard: the prompt explains what's wrong and asks
+again. Labels are cleaned up automatically, so `docker, linux` becomes `docker`
+(`linux` is a built-in label).
+
+If the host already has runner containers, the wizard lists them first, and points
+you to `gha-runners add` in case you want to add runners to an existing container.
+New containers always get unused hostnames and runner names. An existing GitHub
+runner with the same name is never replaced silently.
+
+## Parallel jobs
+
+A runner executes **one job at a time**. *N* runners means *N* jobs at once, and
+any further jobs wait in GitHub's queue. You choose where the runners live:
+
+| Layout | What you get | Use when |
+|---|---|---|
+| `shared` (default) | 1 LXC, *N* runners, one Docker, disk and image | trusted repos; least overhead |
+| `separate` | *N* LXCs, 1 runner each, each with its own firewall and Docker | untrusted or mixed repos; jobs fully isolated from each other |
+
+`separate` costs about 0.5 GB of RAM plus one image copy (~3 GB or ~13 GB of disk)
+per extra container. The image is built only once and copied to the others. All
+runners are registered before the build, so the 1-hour pair code doesn't expire.
+With a static IP, the address is counted up per container (`.50`, `.51`, …).
 
 ## Network isolation
 
@@ -169,7 +195,7 @@ CTID=150 \
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/quavon-dev/quavon-docker-runners/main/install.sh)"
 ```
 
-Other variables: `SIZE=custom` with `RUNNER_CPUS` / `RUNNER_MEM`, `CORES` / `RAM` / `DISK`
+Other variables: `LAYOUT=shared|separate`, `SIZE=custom` with `RUNNER_CPUS` / `RUNNER_MEM`, `CORES` / `RAM` / `DISK`
 (override the totals), `NET_ISOLATION=internet|lan`, `DNS_SERVERS`, `LAN_ALLOW=10.0.0.5,10.0.10.0/24`,
 `RUNNER_MODE=ephemeral` with `GH_PAT`, `RUNNER_PREFIX`, `RUNNER_GROUP`,
 `CT_HOSTNAME`, `SWAP`, `BRIDGE`, `NET_IP` / `NET_GW`, `VLAN`, `SSH_KEYS`, `UNPRIVILEGED`,

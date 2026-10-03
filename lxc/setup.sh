@@ -3,7 +3,9 @@
 #
 #   setup.sh docker            install Docker Engine and verify it can run containers
 #   setup.sh files             (re)install CLI + systemd units from this repo
-#   setup.sh install <envfile> register runners, build the image, start everything
+#   setup.sh register <envfile> register runners from the bootstrap file (phase 1)
+#   setup.sh start             build the image if missing, start all runners (phase 2)
+#   setup.sh install <envfile> both phases
 set -Eeuo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -75,7 +77,8 @@ write_config() {   # write_config <flavor> <labels> <cpus> <mem MB>
   } >"${CONF_DIR}/config.env"
 }
 
-setup_install() {
+# Phase 1: register runners (tokens expire after 1 hour - do this first).
+setup_register() {
   local bootstrap="${1:?bootstrap env file required}"
   [[ -f "$bootstrap" ]] || die "bootstrap file $bootstrap not found"
   # shellcheck source=/dev/null
@@ -88,8 +91,7 @@ setup_install() {
   ensure_runner_user
   write_config "$RUNNER_FLAVOR" "${RUNNER_LABELS:-}" "${RUNNER_CPUS:-}" "${RUNNER_MEM:-}"
 
-  # Register first: registration tokens expire after 1 hour, the image build can take a while.
-  local i name names=() args
+  local i name args
   for ((i = 1; i <= RUNNER_COUNT; i++)); do
     name="$RUNNER_PREFIX"; [[ "$RUNNER_COUNT" -gt 1 ]] && name="${RUNNER_PREFIX}-${i}"
     log "Configuring runner ${name}"
@@ -98,14 +100,18 @@ setup_install() {
     [[ "${RUNNER_EPHEMERAL:-0}" == 1 ]] && args+=(--ephemeral)
     # Secrets via env, not argv (keeps them out of `ps`).
     GHA_TOKEN="${GH_TOKEN:-}" GHA_PAT="${GH_PAT:-}" gha-runners add "${args[@]}"
-    names+=("$name")
   done
+}
 
-  log "Building runner image (${RUNNER_FLAVOR})"
-  gha-runners build --flavor "$RUNNER_FLAVOR"
-
-  log "Starting runners"
-  for name in "${names[@]}"; do
+# Phase 2: make sure the image exists, then start every configured runner.
+setup_start() {
+  # shellcheck source=/dev/null
+  source "${CONF_DIR}/config.env"
+  docker image inspect "$RUNNER_IMAGE" >/dev/null 2>&1 || gha-runners build --flavor "$RUNNER_FLAVOR"
+  local f name
+  for f in "${CONF_DIR}"/runners/*.env; do
+    [[ -e "$f" ]] || continue
+    name="${f##*/}"; name="${name%.env}"
     systemctl enable --now "gha-runner@${name}.service"
   done
   sleep 5
@@ -115,6 +121,8 @@ setup_install() {
 case "${1:-}" in
   docker) setup_docker ;;
   files) setup_files ;;
-  install) setup_install "${2:-}" ;;
-  *) die "usage: setup.sh docker|files|install <envfile>" ;;
+  register) setup_register "${2:-}" ;;
+  start) setup_start ;;
+  install) setup_register "${2:-}"; setup_start ;;
+  *) die "usage: setup.sh docker|files|register <envfile>|start|install <envfile>" ;;
 esac

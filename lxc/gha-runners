@@ -208,11 +208,12 @@ cmd_add() {
 
   if [[ "$ephemeral" == 0 ]]; then
     info "Registering '${name}' with ${url}"
-    local args=(--unattended --replace --url "$url" --name "$name" --work _work)
+    # No --replace: an existing GitHub runner with this name must not be taken over silently.
+    local args=(--unattended --url "$url" --name "$name" --work _work)
     [[ -n "$labels" ]] && args+=(--labels "$labels")
     [[ -n "$group" ]] && args+=(--runnergroup "$group")
     runner_config "$dir" "$token" "${args[@]}" \
-      || { rm -rf "$dir"; die "registration failed (token expired? tokens are valid for 1 hour)"; }
+      || { rm -rf "$dir"; die "registration failed - token expired (valid 1 hour) or a runner named '${name}' already exists in GitHub"; }
   fi
 
   write_runner_env "$name" "$dir" "$url" "$labels" "$group" "$ephemeral" "$pat"
