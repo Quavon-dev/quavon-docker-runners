@@ -91,14 +91,17 @@ setup_register() {
   ensure_runner_user
   write_config "$RUNNER_FLAVOR" "${RUNNER_LABELS:-}" "${RUNNER_CPUS:-}" "${RUNNER_MEM:-}"
 
-  local i name args
-  for ((i = 1; i <= RUNNER_COUNT; i++)); do
+  # Re-runs (e.g. after a name clash) only add the runners still missing.
+  local i name args have
+  have="$(find "${CONF_DIR}/runners" -name '*.env' 2>/dev/null | wc -l)"
+  for ((i = have + 1; i <= RUNNER_COUNT; i++)); do
     name="$RUNNER_PREFIX"; [[ "$RUNNER_COUNT" -gt 1 ]] && name="${RUNNER_PREFIX}-${i}"
     log "Configuring runner ${name}"
     args=(--name "$name" --url "$GH_URL" --labels "${RUNNER_LABELS:-}" --no-start)
     [[ -n "${RUNNER_GROUP:-}" ]] && args+=(--group "$RUNNER_GROUP")
     [[ "${RUNNER_EPHEMERAL:-0}" == 1 ]] && args+=(--ephemeral)
     # Secrets via env, not argv (keeps them out of `ps`).
+    # exit 4 = name already taken in GitHub; install.sh asks for another name
     GHA_TOKEN="${GH_TOKEN:-}" GHA_PAT="${GH_PAT:-}" gha-runners add "${args[@]}"
   done
 }

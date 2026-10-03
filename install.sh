@@ -25,10 +25,97 @@ fi
 
 # ---------------------------------------------------------------- ui helpers --
 YW=$'\e[33m' GN=$'\e[1;92m' RD=$'\e[01;31m' BL=$'\e[36m' DIM=$'\e[2m' CL=$'\e[m'
-msg_info()  { printf ' %s…%s %s\n' "$YW" "$CL" "$*"; }
-msg_ok()    { printf ' %s✔%s %s\n' "$GN" "$CL" "$*"; }
-msg_error() { printf ' %s✖ %s%s\n' "$RD" "$*" "$CL" >&2; }
+# Progress output in the style of the Proxmox VE helper scripts:
+#   ⠹ Installing Docker - Verifying Docker can run containers (0:42)
+#   ✔ Installed Docker (1:07)
+# Command output goes to LOG_FILE; VERBOSE=1 streams it to the terminal instead.
+LOG_FILE="${LOG_FILE:-/tmp/gha-runners-install-$(date +%Y%m%d-%H%M%S).log}"
+VERBOSE="${VERBOSE:-0}"
+SPINNER_PID="" STEP_TEXT="" STEP_START=0 STEP_LOG_LINE=0
+FANCY=0; [[ -t 1 && "$VERBOSE" != 1 ]] && FANCY=1
+
+fmt_elapsed() { printf '%d:%02d' $(($1 / 60)) $(($1 % 60)); }
+
+spinner_stop() {
+  if [[ -n "$SPINNER_PID" ]]; then
+    kill "$SPINNER_PID" 2>/dev/null || true
+    wait "$SPINNER_PID" 2>/dev/null || true
+    SPINNER_PID=""
+    printf '\r\e[K'
+  fi
+}
+
+# msg_info <text> [log-pattern]: start a step. With a pattern, the newest log
+# line matching it is shown as live sub-status (e.g. current build step).
+msg_info() {
+  spinner_stop
+  STEP_TEXT="$1" STEP_START=$SECONDS
+  if [[ "$FANCY" != 1 ]]; then printf ' %s…%s %s\n' "$YW" "$CL" "$1"; return 0; fi
+  local text="$1" pattern="${2:-}" start=$SECONDS cols
+  cols="$(tput cols 2>/dev/null || echo 80)"
+  (
+    # Cosmetic loop: never let errexit/ERR trap fire in here (grep "no match" is normal).
+    set +eE +o pipefail; trap - ERR EXIT; trap 'exit 0' TERM
+    frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏) i=0
+    while :; do
+      sub=""
+      if [[ -n "$pattern" && -f "$LOG_FILE" ]]; then
+        sub="$(tail -n 300 "$LOG_FILE" 2>/dev/null | grep -E "$pattern" | tail -n1 \
+          | sed -E "s/$pattern//; s/\x1b\[[0-9;]*m//g; s/^[[:space:]]+//")"
+      fi
+      line=" ${frames[i++ % 10]} ${text}${sub:+ - ${sub}}"
+      el="($(fmt_elapsed $((SECONDS - start))))"
+      (( ${#line} + ${#el} + 2 > cols )) && line="${line:0:$((cols - ${#el} - 5))}..."
+      printf '\r\e[K%s%s%s %s%s%s' "$YW" "$line" "$CL" "$DIM" "$el" "$CL"
+      sleep 0.2
+    done
+  ) &
+  SPINNER_PID=$!
+}
+
+msg_ok() {
+  spinner_stop
+  local el=""; [[ -n "$STEP_TEXT" ]] && el=" ${DIM}($(fmt_elapsed $((SECONDS - STEP_START))))${CL}"
+  printf ' %s✔%s %s%s\n' "$GN" "$CL" "$*" "$el"
+  STEP_TEXT=""
+}
+msg_warn()  { spinner_stop; printf ' %s⚠%s %s\n' "$YW" "$CL" "$*"; }
+msg_error() { spinner_stop; printf ' %s✖ %s%s\n' "$RD" "$*" "$CL" >&2; STEP_TEXT=""; }
 die()       { msg_error "$*"; exit 1; }
+
+# After a failure, show the failing step's own output so the cause is visible.
+show_log_tail() {
+  [[ "$VERBOSE" == 1 || ! -s "$LOG_FILE" ]] && return 0
+  printf '\n%s--- output of the failed step (full log: %s) ---%s\n' "$DIM" "$LOG_FILE" "$CL" >&2
+  tail -n +"$((STEP_LOG_LINE + 1))" "$LOG_FILE" | tail -n 25 | sed 's/^/   /' >&2
+  printf '%s---%s\n\n' "$DIM" "$CL" >&2
+}
+
+# run <cmd...>: run a step command with output in the log (or live in VERBOSE).
+run() {
+  printf '\n### %s\n' "$*" >>"$LOG_FILE"
+  STEP_LOG_LINE="$(wc -l <"$LOG_FILE")"
+  if [[ "$VERBOSE" == 1 ]]; then
+    "$@" 2>&1 | tee -a "$LOG_FILE"
+  else
+    "$@" >>"$LOG_FILE" 2>&1
+  fi
+}
+
+# step <text> <done-text> [--status PATTERN] -- <cmd...>
+# Spinner while the command runs; ✔ on success, ✖ + log tail + exit on failure.
+step() {
+  local text="$1" done="$2" pattern=""; shift 2
+  if [[ "${1:-}" == --status ]]; then pattern="$2"; shift 2; fi
+  [[ "${1:-}" == -- ]] && shift
+  msg_info "$text" "$pattern"
+  local rc=0
+  run "$@" || rc=$?
+  if [[ "$rc" == 0 ]]; then msg_ok "$done"; return 0; fi
+  msg_error "${text} failed (exit ${rc})"
+  show_log_tail
+  exit "$rc"
+}
 
 header() {
   clear 2>/dev/null || true
@@ -91,22 +178,27 @@ CREATED_CTS=()
 BOOTSTRAP_TMP=""
 on_error() {
   local rc=$?
-  [[ "$rc" == 130 ]] || msg_error "Failed (exit ${rc}) at line $1"
+  [[ "$rc" == 130 ]] && return 0
+  msg_error "${STEP_TEXT:-Installer} failed (exit ${rc}, line $1)"
+  show_log_tail
 }
 # Runs on every exit (die, ERR, signals): wipe secrets, offer to drop a broken CT.
 on_exit() {
   local rc=$?
   trap - EXIT ERR
+  spinner_stop
+  [[ "$FANCY" == 1 ]] && tput cnorm 2>/dev/null
+  [[ "$rc" != 0 && "$rc" != 130 && -s "$LOG_FILE" ]] && msg_warn "Full log: ${LOG_FILE}"
   [[ -n "$BOOTSTRAP_TMP" ]] && rm -f "$BOOTSTRAP_TMP"
   if [[ "$rc" != 0 && ${#CREATED_CTS[@]} -gt 0 ]]; then
     if w_yesno "Installation failed.\n\nDestroy the container(s) created by this run: ${CREATED_CTS[*]}?" 0; then
       local id
       for id in "${CREATED_CTS[@]}"; do
         pct stop "$id" >/dev/null 2>&1 || true
-        pct destroy "$id" --purge >/dev/null 2>&1 && msg_ok "Container ${id} destroyed"
+        pct destroy "$id" --purge >/dev/null 2>&1 && msg_ok "Destroyed container ${id}"
       done
     else
-      msg_info "Kept for debugging: ${CREATED_CTS[*]} (pct enter <id>)"
+      msg_warn "Kept for debugging: ${CREATED_CTS[*]} (pct enter <id>)"
     fi
   fi
   exit "$rc"
@@ -174,15 +266,10 @@ valid_labels() {
 }
 valid_ctid() {
   valid_posint "$1" && (( $1 >= 100 && $1 <= 999999999 )) || return 1
-  ! id_in_use "$1"
+  id_free "$1"
 }
 valid_any() { return 0; }
-# Hostname must be valid and, with its -1/-2 suffixes, unused on this host.
-valid_free_hostname() {
-  valid_name "$1" || return 1
-  local taken; taken=" $(all_ct_hostnames | tr '\n' ' ') "
-  [[ "$taken" != *" $1 "* && "$taken" != *" $1-1 "* ]]
-}
+
 
 # "docker, GPU ,docker,,self-hosted" -> "docker,GPU": strips whitespace, empty
 # entries, duplicates and the labels GitHub adds by itself.
@@ -260,77 +347,14 @@ pick_storage() {   # pick_storage <content> <label>
   w_menu "Storage for ${label}" "$first" "${items[@]}"
 }
 
-# Guest configs are read straight from the cluster filesystem: `pct`/`qm` start
-# Perl (~0.5-1 s per call), which froze the wizard for a minute on busy hosts.
-PVE_NODES_DIR="${PVE_NODES_DIR:-/etc/pve/nodes}"
-
-ct_conf_files() { compgen -G "${PVE_NODES_DIR}/*/lxc/*.conf" || true; }
-
-id_in_use() {
-  compgen -G "${PVE_NODES_DIR}/*/lxc/$1.conf" >/dev/null \
-    || compgen -G "${PVE_NODES_DIR}/*/qemu-server/$1.conf" >/dev/null
-}
-
-# Value of <key> in the main section of a guest config (ignores snapshots).
-conf_get() {   # conf_get <file> <key>
-  awk -v k="$2:" '/^\[/ {exit} $1 == k {sub(/^[^:]+:[[:space:]]*/, ""); print; exit}' "$1"
-}
-
-next_free_id() {   # next_free_id <start>
-  local id="$1"
-  while id_in_use "$id"; do id=$((id + 1)); done
-  echo "$id"
-}
-
-# Existing LXCs created by this installer (tagged github-runner): "<id> <hostname>"
-existing_runner_cts() {
-  local f id
-  while read -r f; do
-    [[ -n "$f" ]] || continue
-    [[ "$(conf_get "$f" tags)" == *github-runner* ]] || continue
-    id="${f##*/}"; echo "${id%.conf} $(conf_get "$f" hostname)"
-  done < <(ct_conf_files)
-}
-
-all_ct_hostnames() {
-  local f
-  while read -r f; do
-    [[ -n "$f" ]] && conf_get "$f" hostname
-  done < <(ct_conf_files)
-  return 0
-}
-
-# First of gha-runners, gha-runners-2, ... not used by any container on this host.
-unique_hostname() {   # unique_hostname <base>
-  local base="$1" name="$1" n=2 taken
-  taken=" $(all_ct_hostnames | tr '\n' ' ') "
-  while [[ "$taken" == *" ${name} "* || "$taken" == *" ${name}-1 "* ]]; do
-    name="${base}-${n}"; n=$((n + 1))
-  done
-  echo "$name"
-}
-
-# The "check": tell the user about runner LXCs already on this host, because
-# adding runners there may be what they actually want.
-check_existing() {
-  local existing
-  existing="$(existing_runner_cts)"
-  [[ -z "$existing" ]] && return 0
-  w_yesno "This host already has GitHub runner container(s):
-
-    CT ${existing//$'\n'/$'\n'    CT }
-
-Continuing creates ADDITIONAL container(s) with new, unique names.
-
-To add runners to an existing container instead, cancel and run:
-    pct enter <CT>    then    gha-runners add
-
-Create new container(s)?" 1 || exit_cancel
-}
+# IDs come from Proxmox itself, exactly like the helper scripts: no scanning of
+# other guests. `pvesh get /cluster/nextid --vmid N` fails if N is taken.
+id_free() { pvesh get /cluster/nextid --vmid "$1" >/dev/null 2>&1; }
+next_id() { pvesh get /cluster/nextid; }
 
 defaults() {
   CTID="${CTID:-$(pvesh get /cluster/nextid)}"
-  CT_HOSTNAME="${CT_HOSTNAME:-$(unique_hostname gha-runners)}"
+  CT_HOSTNAME="${CT_HOSTNAME:-gha-runners}"
   RUNNER_FLAVOR="${RUNNER_FLAVOR:-standard}"
   RUNNER_COUNT="${RUNNER_COUNT:-2}"
   LAYOUT="${LAYOUT:-shared}"
@@ -421,10 +445,10 @@ size_defaults() {   # size_defaults <job disk GB per runner>
 
 ask_advanced() {
   local multi=""; [[ "$(ct_count)" -gt 1 ]] && multi=" (first one; the others get the next free IDs)"
-  CTID="$(w_ask "Container ID${multi}" "$CTID" valid_ctid "Use a number >= 100 that no VM/container uses yet.")"
+  CTID="$(w_ask "Container ID${multi}" "$CTID" valid_ctid "Use a number >= 100 that no VM/container uses yet (next free: $(next_id)).")"
   multi=""; [[ "$(ct_count)" -gt 1 ]] && multi=" (-1, -2, ... is appended)"
-  CT_HOSTNAME="$(w_ask "Hostname${multi}" "$CT_HOSTNAME" valid_free_hostname \
-    "Letters, digits and '-', must start with a letter or digit, max 63 - and not used by another container.")"
+  CT_HOSTNAME="$(w_ask "Hostname${multi}" "$CT_HOSTNAME" valid_name \
+    "Letters, digits and '-', must start with a letter or digit, max 63.")"
   CORES="$(w_ask "CPU cores per container" "$CORES" valid_posint "Enter a whole number, e.g. 4.")"
   RAM="$(w_ask "RAM per container in MB" "$RAM" valid_posint "Enter a whole number of MB, e.g. 8192.")"
   SWAP="$(w_ask "Swap per container in MB" "$SWAP" valid_posint "Enter a whole number of MB, e.g. 1024.")"
@@ -494,11 +518,10 @@ ip_offset() {
 # Resolve per-container ID, hostname, IP and runner prefix.
 plan_containers() {
   PLAN_IDS=() PLAN_NAMES=() PLAN_IPS=() PLAN_PREFIXES=()
-  local i n id="$CTID"
+  local i n
   n="$(ct_count)"
   for ((i = 0; i < n; i++)); do
-    id="$(next_free_id "$id")"
-    PLAN_IDS+=("$id")
+    PLAN_IDS+=("$([[ $i == 0 ]] && echo "$CTID" || echo next)")   # "next" = resolved at creation
     if (( n > 1 )); then
       PLAN_NAMES+=("${CT_HOSTNAME}-$((i + 1))")
       PLAN_PREFIXES+=("${RUNNER_PREFIX}-$((i + 1))")
@@ -507,7 +530,6 @@ plan_containers() {
       PLAN_PREFIXES+=("$RUNNER_PREFIX")
     fi
     if [[ "$NET_IP" == dhcp ]]; then PLAN_IPS+=(dhcp); else PLAN_IPS+=("$(ip_offset "$NET_IP" "$i")"); fi
-    id=$((id + 1))
   done
 }
 
@@ -531,12 +553,6 @@ validate_settings() {
   valid_sshkey "$SSH_KEYS" || die "SSH key file not found: $SSH_KEYS"
   valid_bridge "$BRIDGE" || die "Bridge $BRIDGE does not exist"
 
-  local taken name
-  taken=" $(all_ct_hostnames | tr '\n' ' ') "
-  for name in "${PLAN_NAMES[@]}"; do
-    [[ "$taken" == *" ${name} "* ]] && die "Hostname '${name}' is already used by another container on this host."
-  done
-
   local total_ram=$(( RAM * $(ct_count) ))
   if (( total_ram > $(host_ram_mb) )); then
     w_yesno "The RAM limits add up to ${total_ram} MB, more than the host's $(host_ram_mb) MB.
@@ -551,7 +567,7 @@ confirm() {
   local mode=persistent; [[ "$RUNNER_EPHEMERAL" == 1 ]] && mode=ephemeral
   local i list="" n; n="$(ct_count)"
   for ((i = 0; i < n; i++)); do
-    list+="    CT ${PLAN_IDS[$i]}  ${PLAN_NAMES[$i]}  ${PLAN_IPS[$i]}  -> runner(s) ${PLAN_PREFIXES[$i]}$( [[ "$(runners_per_ct)" -gt 1 ]] && echo "-1..$(runners_per_ct)")
+    list+="    CT $([[ ${PLAN_IDS[$i]} == next ]] && echo "(next free)" || echo "${PLAN_IDS[$i]}")  ${PLAN_NAMES[$i]}  ${PLAN_IPS[$i]}  -> runner(s) ${PLAN_PREFIXES[$i]}$( [[ "$(runners_per_ct)" -gt 1 ]] && echo "-1..$(runners_per_ct)")
 "
   done
   local whiptail_height=$(( 22 + n ))
@@ -571,22 +587,26 @@ Continue?" "$whiptail_height" 78 || exit_cancel
 }
 
 # ----------------------------------------------------------------- container --
-ensure_template() {
-  msg_info "Updating LXC template list"
-  pveam update >/dev/null 2>&1 || true
+find_template() {
   local available tmpl="" v
   available="$(pveam available --section system | awk '{print $2}')"
   for v in 13 12; do
     tmpl="$(awk -v p="^debian-${v}-standard" '$0 ~ p' <<<"$available" | sort -V | tail -n1)"
     [[ -n "$tmpl" ]] && break
   done
+  echo "$tmpl"
+}
+
+ensure_template() {
+  step "Updating LXC template list" "Updated LXC template list" -- bash -c 'pveam update || true'
+  local tmpl; tmpl="$(find_template)"
   [[ -n "$tmpl" ]] || die "No Debian 12/13 template available from pveam."
-  if ! grep -qF "$tmpl" <<<"$(pveam list "$TMPL_STORAGE")"; then
-    msg_info "Downloading template ${tmpl}"
-    pveam download "$TMPL_STORAGE" "$tmpl" >/dev/null
+  if grep -qF "$tmpl" <<<"$(pveam list "$TMPL_STORAGE")"; then
+    msg_ok "Template ${tmpl} already present"
+  else
+    step "Downloading template ${tmpl}" "Downloaded template ${tmpl}" -- pveam download "$TMPL_STORAGE" "$tmpl"
   fi
   TEMPLATE="${TMPL_STORAGE}:vztmpl/${tmpl}"
-  msg_ok "Template ${tmpl}"
 }
 
 create_ct() {   # uses CTID, CUR_HOSTNAME, CUR_IP
@@ -615,10 +635,10 @@ GitHub: ${GH_URL}"
   # Fixed public resolvers: a DHCP-provided LAN resolver would be blocked anyway.
   [[ "$NET_ISOLATION" == internet ]] && args+=(--nameserver "$DNS_SERVERS")
 
-  msg_info "Creating LXC ${CTID} (${CUR_HOSTNAME})"
   CREATED_CTS+=("$CTID")   # first: a half-finished create still gets cleaned up
-  pct create "$CTID" "$TEMPLATE" "${args[@]}" >/dev/null
-  msg_ok "Created LXC ${CTID} (${CUR_HOSTNAME})"
+  step "Creating LXC container ${CTID}" \
+    "Created LXC ${CTID} (${CUR_HOSTNAME}: ${CORES} cores, ${RAM} MB, ${DISK} GB)" \
+    -- pct create "$CTID" "$TEMPLATE" "${args[@]}"
 }
 
 # ------------------------------------------------------------------ firewall --
@@ -638,6 +658,7 @@ is_private_ip() {
 ensure_cluster_firewall() {
   local fw=/etc/pve/firewall/cluster.fw
   if [[ -f "$fw" ]] && grep -qE '^enable:[[:space:]]*1' "$fw"; then
+    msg_ok "Datacenter firewall is enabled"
     return 0
   fi
   if [[ -f "$fw" ]] && grep -qE '^policy_in:[[:space:]]*DROP' "$fw"; then
@@ -646,7 +667,7 @@ ensure_cluster_firewall() {
 Turning it on would apply that DROP policy to the Proxmox host and could
 lock you out of the web UI/SSH. Enable it anyway?" 0 \
       || die "Isolation needs the datacenter firewall. Enable it yourself, or re-run with NET_ISOLATION=lan."
-    pvesh set /cluster/firewall/options --enable 1 >/dev/null
+    step "Enabling datacenter firewall" "Enabled datacenter firewall" -- pvesh set /cluster/firewall/options --enable 1
   else
     w_yesno "Network isolation needs the Proxmox datacenter firewall, which is OFF.
 
@@ -654,9 +675,9 @@ It will be enabled with input policy ACCEPT, so the host and all other
 guests keep working exactly as before. Only this container gets rules.
 
 Enable it?" 1 || die "Isolation needs the datacenter firewall (or re-run with NET_ISOLATION=lan)."
-    pvesh set /cluster/firewall/options --enable 1 --policy_in ACCEPT >/dev/null
+    step "Enabling datacenter firewall" "Enabled datacenter firewall (input policy ACCEPT)" \
+      -- pvesh set /cluster/firewall/options --enable 1 --policy_in ACCEPT
   fi
-  msg_ok "Datacenter firewall enabled"
 }
 
 write_ct_firewall() {
@@ -686,64 +707,81 @@ write_ct_firewall() {
     # REJECT (not DROP): blocked connections fail instantly, no timeouts.
     echo "OUT REJECT -dest +lan_block -log nolog"
   } >"$fw"
-  msg_ok "Firewall: internet only${LAN_ALLOW:+, plus ${LAN_ALLOW}}"
 }
 
 setup_firewall() {
   [[ "$NET_ISOLATION" == internet ]] || return 0
   ensure_cluster_firewall
-  write_ct_firewall
+  step "Writing firewall rules" "Firewall rules: internet only${LAN_ALLOW:+, plus ${LAN_ALLOW}}" -- write_ct_firewall
 }
 
-# Prove it: GitHub must work, the Proxmox host (web UI port) must not.
+# Prove it: GitHub must work, the Proxmox host (web UI port) and gateway must not.
+probe() { pct exec "$CTID" -- bash -c 'timeout 4 bash -c "</dev/tcp/$1/$2"' _ "$1" "$2" 2>/dev/null; }
+
+check_isolation() {
+  sleep 12   # pve-firewall applies config changes within ~10s
+  local host_ip gw
+  host_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[0-9.]+' || true)"
+  gw="$(pct exec "$CTID" -- ip -4 route show default | awk '{print $3; exit}')"
+  probe github.com 443 || { echo "github.com:443 NOT reachable"; return 1; }
+  echo "github.com:443 reachable"
+  if [[ -n "$host_ip" ]] && probe "$host_ip" 8006; then echo "Proxmox host ${host_ip}:8006 REACHABLE"; return 1; fi
+  echo "Proxmox host ${host_ip:-?}:8006 blocked"
+  if [[ -n "$gw" ]] && probe "$gw" 80; then echo "gateway ${gw}:80 REACHABLE"; return 1; fi
+  echo "gateway ${gw:-?}:80 blocked"
+  ISO_SUMMARY="github.com reachable; host ${host_ip:-?} and gateway ${gw:-?} blocked"
+}
+
 verify_isolation() {
   [[ "$NET_ISOLATION" == internet ]] || return 0
-  local host_ip probe='timeout 4 bash -c "</dev/tcp/$1/$2" 2>/dev/null'
-  host_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[0-9.]+' || true)"
-  local gw; gw="$(pct exec "$CTID" -- ip -4 route show default | awk '{print $3; exit}')"
+  ISO_SUMMARY=""
   msg_info "Verifying network isolation"
-  sleep 12   # pve-firewall applies config changes within ~10s
-  pct exec "$CTID" -- bash -c "$probe" _ github.com 443 \
-    || die "Container cannot reach github.com:443 through the firewall."
-  if [[ -n "$host_ip" ]] && pct exec "$CTID" -- bash -c "$probe" _ "$host_ip" 8006; then
-    die "Isolation NOT effective: container reaches the Proxmox host ${host_ip}:8006. Check 'pve-firewall status'."
+  if check_isolation >>"$LOG_FILE" 2>&1; then
+    msg_ok "Isolation verified: ${ISO_SUMMARY}"
+  else
+    msg_error "Isolation check failed: $(tail -n1 "$LOG_FILE")"
+    die "Check 'pve-firewall status' on the host. Nothing was installed in the container yet."
   fi
-  if [[ -n "$gw" ]] && pct exec "$CTID" -- bash -c "$probe" _ "$gw" 80; then
-    die "Isolation NOT effective: container reaches its gateway ${gw}:80 (router UI)."
-  fi
-  msg_ok "Isolated: github.com reachable; Proxmox host ${host_ip:-?} and gateway ${gw:-?} blocked"
+}
+
+wait_network() {
+  local _
+  for _ in $(seq 1 60); do
+    pct exec "$CTID" -- getent hosts github.com >/dev/null 2>&1 && return 0
+    sleep 2
+  done
+  return 1
 }
 
 start_ct() {
-  pct start "$CTID"
-  msg_info "Waiting for network"
-  pct exec "$CTID" -- bash -c 'for _ in $(seq 1 60); do getent hosts github.com >/dev/null && exit 0; sleep 2; done; exit 1' \
-    || die "Container has no network/DNS (check bridge, DHCP, VLAN)."
-  msg_ok "Network up ($(pct exec "$CTID" -- hostname -I | awk '{print $1}'))"
+  step "Starting container ${CTID}" "Started container ${CTID}" -- pct start "$CTID"
+  msg_info "Waiting for network (DHCP + DNS)"
+  wait_network || { msg_error "No network in container ${CTID}"; die "Check bridge, DHCP and VLAN."; }
+  msg_ok "Network up: $(pct exec "$CTID" -- hostname -I | awk '{print $1}')"
 }
 
 # Copy the repo into the CT: local checkout if we run from one, else git clone.
 deploy_repo() {
+  step "Updating container OS packages" "Updated container OS packages" \
+    --status '^(Get|Unpacking|Setting up)' \
+    -- pct exec "$CTID" -- bash -c 'export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get -y dist-upgrade && apt-get install -y git curl ca-certificates'
   local src_dir
   src_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
-  msg_info "Preparing base system"
-  pct exec "$CTID" -- bash -c 'export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get -y -qq dist-upgrade >/dev/null && apt-get install -y -qq git curl ca-certificates >/dev/null'
   if [[ -n "$src_dir" && -f "${src_dir}/lxc/setup.sh" ]]; then
-    msg_info "Copying local checkout ${src_dir}"
-    tar -C "$src_dir" -czf - . | pct exec "$CTID" -- bash -c "mkdir -p ${CT_REPO_DIR} && tar -xzf - -C ${CT_REPO_DIR}"
+    step "Copying local checkout" "Deployed scripts from ${src_dir}" \
+      -- bash -c "tar -C '$src_dir' -czf - . | pct exec '$CTID' -- bash -c 'mkdir -p ${CT_REPO_DIR} && tar -xzf - -C ${CT_REPO_DIR}'"
   else
-    msg_info "Cloning ${REPO_URL} (${REPO_BRANCH})"
-    pct exec "$CTID" -- git clone --quiet --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$CT_REPO_DIR"
+    step "Downloading installer scripts" "Deployed scripts (${REPO_BRANCH})" \
+      -- pct exec "$CTID" -- git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$CT_REPO_DIR"
   fi
-  msg_ok "Scripts deployed to ${CT_REPO_DIR}"
 }
 
 install_docker() {
-  msg_info "Installing Docker in the container"
   local rc=0
-  pct exec "$CTID" -- bash "${CT_REPO_DIR}/lxc/setup.sh" docker || rc=$?
+  msg_info "Installing Docker" '^==> '
+  run pct exec "$CTID" -- bash "${CT_REPO_DIR}/lxc/setup.sh" docker || rc=$?
   if [[ "$rc" == 3 ]]; then
-    msg_error "Docker cannot start containers in this LXC (usually AppArmor on nested containers)."
+    msg_warn "Docker cannot start containers in this LXC (usually AppArmor on nested containers)"
     w_yesno "Docker could not run a test container.
 
 Common fix on Proxmox: run the LXC with an unconfined AppArmor profile
@@ -751,19 +789,24 @@ Common fix on Proxmox: run the LXC with an unconfined AppArmor profile
 container and the host.
 
 Apply the fix and retry?" 1 || die "Docker not working - aborted."
-    pct stop "$CTID"
+    step "Stopping container ${CTID}" "Stopped container ${CTID}" -- pct stop "$CTID"
     echo "lxc.apparmor.profile: unconfined" >>"/etc/pve/lxc/${CTID}.conf"
+    msg_ok "Applied AppArmor fix"
     start_ct
-    pct exec "$CTID" -- bash "${CT_REPO_DIR}/lxc/setup.sh" docker
-  elif [[ "$rc" != 0 ]]; then
-    return "$rc"
+    step "Installing Docker (retry)" "Installed Docker" --status '^==> ' \
+      -- pct exec "$CTID" -- bash "${CT_REPO_DIR}/lxc/setup.sh" docker
+  elif [[ "$rc" == 0 ]]; then
+    msg_ok "Installed Docker ($(pct exec "$CTID" -- docker --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+'))"
+  else
+    msg_error "Installing Docker failed (exit ${rc})"
+    show_log_tail
+    exit "$rc"
   fi
-  msg_ok "Docker ready"
 }
 
 # Phase 1 (per container): register runners right away - the pair code
 # expires after 1 hour, and building images for several containers takes longer.
-register_runners() {   # uses CTID, CUR_PREFIX
+push_bootstrap() {   # uses CTID, CUR_PREFIX
   local tmp; tmp="$(mktemp)"
   BOOTSTRAP_TMP="$tmp"   # removed by on_exit even if pct push fails
   chmod 600 "$tmp"
@@ -782,15 +825,45 @@ register_runners() {   # uses CTID, CUR_PREFIX
   } >"$tmp"
   pct push "$CTID" "$tmp" /root/.gha-bootstrap.env --perms 600
   rm -f "$tmp"; BOOTSTRAP_TMP=""
+}
 
-  msg_info "Registering runner(s) ${CUR_PREFIX} with GitHub"
-  pct exec "$CTID" -- bash "${CT_REPO_DIR}/lxc/setup.sh" register /root/.gha-bootstrap.env
-  msg_ok "Registered in CT ${CTID}"
+register_runners() {   # uses CTID, CUR_PREFIX
+  local rc
+  while true; do
+    push_bootstrap
+    msg_info "Registering runner(s) with GitHub" '^(==> |√|Runner successfully)'
+    rc=0
+    run pct exec "$CTID" -- bash "${CT_REPO_DIR}/lxc/setup.sh" register /root/.gha-bootstrap.env || rc=$?
+    if [[ "$rc" == 0 ]]; then
+      msg_ok "Registered runner(s): $(pct exec "$CTID" -- bash -c 'ls /etc/gha-runners/runners/ | sed -n "s/\.env$//p" | paste -sd, -')"
+      return 0
+    fi
+    if [[ "$rc" == 4 ]]; then   # setup.sh: name already exists in GitHub
+      msg_warn "A runner named '${CUR_PREFIX}...' already exists in GitHub"
+      [[ "$NONINTERACTIVE" == 1 ]] && die "Choose another RUNNER_PREFIX."
+      CUR_PREFIX="$(w_ask "A runner with this name already exists in GitHub.
+
+Enter a different runner name:" "${CUR_PREFIX}-b" valid_name \
+        "Letters, digits and '-', must start with a letter or digit." normalize_trim)"
+      continue
+    fi
+    msg_error "Registering runner(s) failed (exit ${rc})"
+    show_log_tail
+    exit "$rc"
+  done
+}
+
+runner_names_for() {   # runner_names_for <prefix>
+  local n i out=(); n="$(runners_per_ct)"
+  if (( n == 1 )); then echo "$1"; return; fi
+  for ((i = 1; i <= n; i++)); do out+=("$1-$i"); done
+  (IFS=', '; echo "${out[*]}")
 }
 
 provision_ct() {   # provision_ct <index>
+  [[ "${PLAN_IDS[$1]}" == next ]] && PLAN_IDS[$1]="$(next_id)"
   CTID="${PLAN_IDS[$1]}" CUR_HOSTNAME="${PLAN_NAMES[$1]}" CUR_IP="${PLAN_IPS[$1]}" CUR_PREFIX="${PLAN_PREFIXES[$1]}"
-  printf '\n%s── Container %s/%s: CT %s (%s) ──%s\n' "$BL" "$(( $1 + 1 ))" "$(ct_count)" "$CTID" "$CUR_HOSTNAME" "$CL"
+  printf '\n %s[%s/%s] Container %s (%s)%s\n' "$BL" "$(( $1 + 1 ))" "$(ct_count)" "$CTID" "$CUR_HOSTNAME" "$CL"
   create_ct
   setup_firewall
   start_ct
@@ -803,21 +876,44 @@ provision_ct() {   # provision_ct <index>
 # Phase 2: build the image once, copy it to the other containers, start all.
 finish_all() {
   local image="quavon/gha-runner:${RUNNER_FLAVOR}" first="${PLAN_IDS[0]}" id
-  printf '\n%s── Runner image ──%s\n' "$BL" "$CL"
-  msg_info "Building '${RUNNER_FLAVOR}' image in CT ${first} (standard ~5-10 min, full ~20-40 min)"
-  pct exec "$first" -- gha-runners build --flavor "$RUNNER_FLAVOR"
-  msg_ok "Image built"
+  printf '\n %sRunner image%s\n' "$BL" "$CL"
+  step "Building '${RUNNER_FLAVOR}' image (standard ~5-10 min, full ~20-40 min)" \
+    "Built runner image ${image}" --status '.*### step ' \
+    -- pct exec "$first" -- gha-runners build --flavor "$RUNNER_FLAVOR"
   for id in "${PLAN_IDS[@]:1}"; do
-    msg_info "Copying image to CT ${id}"
-    if ! pct exec "$first" -- docker save "$image" | pct exec "$id" -- docker load >/dev/null; then
-      msg_info "Copy failed, building in CT ${id} instead"
-      pct exec "$id" -- gha-runners build --flavor "$RUNNER_FLAVOR"
+    msg_info "Copying image to container ${id}"
+    if run bash -c "pct exec '$first' -- docker save '$image' | pct exec '$id' -- docker load"; then
+      msg_ok "Copied image to container ${id}"
+    else
+      msg_warn "Copy to ${id} failed, building there instead"
+      step "Building image in container ${id}" "Built image in container ${id}" --status '.*### step ' \
+        -- pct exec "$id" -- gha-runners build --flavor "$RUNNER_FLAVOR"
     fi
   done
+  printf '\n %sStarting%s\n' "$BL" "$CL"
   for id in "${PLAN_IDS[@]}"; do
-    pct exec "$id" -- bash "${CT_REPO_DIR}/lxc/setup.sh" start
+    step "Starting runners in container ${id}" "Started runners in container ${id}" \
+      -- pct exec "$id" -- bash "${CT_REPO_DIR}/lxc/setup.sh" start
+    wait_online "$id"
   done
-  msg_ok "All runners started"
+}
+
+# The runner prints "Listening for Jobs" once it is connected to GitHub.
+wait_online() {   # wait_online <ctid>
+  local id="$1" name names _ total online
+  names="$(pct exec "$id" -- bash -c 'ls /etc/gha-runners/runners/ | sed -n "s/\.env$//p"')"
+  total="$(wc -w <<<"$names")"
+  msg_info "Waiting for runner(s) in ${id} to connect to GitHub"
+  for _ in $(seq 1 45); do
+    online=0
+    for name in $names; do
+      pct exec "$id" -- journalctl -u "gha-runner@${name}" --no-pager -n 200 2>/dev/null \
+        | grep -q "Listening for Jobs" && online=$((online + 1))
+    done
+    if (( online == total )); then msg_ok "Online in GitHub: ${names//$'\n'/, }"; return 0; fi
+    sleep 4
+  done
+  msg_warn "${online}/${total} runner(s) online after 3 min - check: pct exec ${id} -- gha-runners logs <name>"
 }
 
 summary() {
@@ -861,12 +957,16 @@ main() {
   preflight
   defaults
   w_yesno "This creates LXC container(s) with Docker and GitHub Actions runners.\n\nProceed?" 1 || exit_cancel
-  msg_info "Checking existing containers"
-  check_existing
   ask_github
   ask_settings
   confirm
   header
+  [[ "$FANCY" == 1 ]] && tput civis 2>/dev/null
+  printf ' %sLog: %s%s
+
+' "$DIM" "$LOG_FILE" "$CL"
+  printf ' %sPreparation%s
+' "$BL" "$CL"
   ensure_template
   local i
   for i in "${!PLAN_IDS[@]}"; do provision_ct "$i"; done

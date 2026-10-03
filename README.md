@@ -66,10 +66,16 @@ Invalid input never aborts the wizard: the prompt explains what's wrong and asks
 again. Labels are cleaned up automatically, so `docker, linux` becomes `docker`
 (`linux` is a built-in label).
 
-If the host already has runner containers, the wizard lists them first, and points
-you to `gha-runners add` in case you want to add runners to an existing container.
-New containers always get unused hostnames and runner names. An existing GitHub
-runner with the same name is never replaced silently.
+Like the Proxmox helper scripts, the installer takes the next free container ID
+from Proxmox and doesn't look at your other guests. If the runner name is already
+taken in GitHub, it asks you for another name and retries. An existing runner is
+never replaced silently.
+
+Every step shows a spinner with what's running and how long it has taken, then a
+✔. Long steps (OS update, Docker, image build) show their current sub-step. All
+command output goes to `/tmp/gha-runners-install-<date>.log`. If a step fails,
+you get a ✖ plus that step's output. `VERBOSE=1` shows all output live, and
+`DEBUG=1` adds a shell trace in `/tmp/gha-install.log`.
 
 ## Parallel jobs
 

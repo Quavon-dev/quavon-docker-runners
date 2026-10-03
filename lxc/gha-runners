@@ -212,8 +212,18 @@ cmd_add() {
     local args=(--unattended --url "$url" --name "$name" --work _work)
     [[ -n "$labels" ]] && args+=(--labels "$labels")
     [[ -n "$group" ]] && args+=(--runnergroup "$group")
-    runner_config "$dir" "$token" "${args[@]}" \
-      || { rm -rf "$dir"; die "registration failed - token expired (valid 1 hour) or a runner named '${name}' already exists in GitHub"; }
+    local out; out="$(mktemp)"
+    if ! runner_config "$dir" "$token" "${args[@]}" 2>&1 | tee "$out"; then
+      rm -rf "$dir"
+      if grep -q "A runner exists with the same name" "$out"; then
+        rm -f "$out"
+        printf '%s✖ a runner named %s already exists in GitHub%s\n' "$c_err" "$name" "$c_off" >&2
+        exit 4
+      fi
+      rm -f "$out"
+      die "registration failed - is the token expired? (valid 1 hour)"
+    fi
+    rm -f "$out"
   fi
 
   write_runner_env "$name" "$dir" "$url" "$labels" "$group" "$ephemeral" "$pat"
