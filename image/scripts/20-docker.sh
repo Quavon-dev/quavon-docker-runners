@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# flavors: standard full
+# flavors: standard full full-plus
 # Docker CLI + buildx + compose. Jobs talk to the LXC's Docker daemon via the
 # mounted socket, so docker build/run, service containers and container jobs work.
 source "$(dirname "$0")/lib.sh"

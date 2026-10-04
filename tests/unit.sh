@@ -46,6 +46,9 @@ RUNNER_COUNT=3 LAYOUT=separate; unset CORES RAM SWAP DISK; size_defaults 6
 t "size separate per CT"       "$CORES $RAM $DISK" "2 5120 12"
 RUNNER_COUNT=8 LAYOUT=shared RUNNER_CPUS=4; unset CORES RAM SWAP DISK; size_defaults 10
 t "cpu clamped to host"        "$CORES" "8"
+RUNNER_FLAVOR=full-plus RUNNER_COUNT=2 RUNNER_CPUS=2; unset CORES RAM SWAP DISK; size_defaults 6
+t "size full-plus image"       "$DISK" "31"
+RUNNER_FLAVOR=standard
 
 # firewall rules
 mkdir -p /etc/pve/firewall; CTID=150 LAN_ALLOW="10.0.0.5"

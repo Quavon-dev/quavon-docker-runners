@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# flavors: full
+# flavors: full full-plus
 # Latest stable Go.
 source "$(dirname "$0")/lib.sh"
 

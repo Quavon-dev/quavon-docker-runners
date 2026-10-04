@@ -2,6 +2,10 @@
 #   FLAVOR=standard  git, gh, docker, python, node, build tools, kubectl, helm
 #   FLAVOR=full      + Go, Java, .NET, Rust, Ruby, PHP, PowerShell,
 #                      Chrome/Firefox, AWS/Azure/GCP CLIs, ansible, kind
+#   FLAVOR=full-plus full + a pinned backend/CI toolchain: bun, Valkey, lsof,
+#                      nats-server, openfga, goose, OpenBao, Temporal CLI,
+#                      TigerBeetle, typst, buf, protoc-gen-go(-connect),
+#                      golangci-lint, gosec, gitleaks, actionlint, kubeconform
 #
 # The runner binaries themselves are NOT baked in: they live in the per-runner
 # directory bind-mounted at the same path on the host, so the runner can
@@ -42,6 +46,7 @@ RUN /opt/gha/build/run-step.sh 54-languages  "$FLAVOR"
 RUN /opt/gha/build/run-step.sh 55-powershell "$FLAVOR"
 RUN /opt/gha/build/run-step.sh 56-browsers   "$FLAVOR"
 RUN /opt/gha/build/run-step.sh 57-cloud      "$FLAVOR"
+RUN /opt/gha/build/run-step.sh 58-ci-stack   "$FLAVOR"
 RUN /opt/gha/build/run-step.sh 99-finalize   "$FLAVOR"
 
 COPY --chmod=0755 entrypoint.sh /opt/gha/entrypoint.sh

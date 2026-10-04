@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# flavors: standard full
+# flavors: standard full full-plus
 # System Python + pip + pipx (pipx paths match hosted runners).
 source "$(dirname "$0")/lib.sh"
 

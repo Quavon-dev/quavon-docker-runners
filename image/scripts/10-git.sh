@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# flavors: standard full
+# flavors: standard full full-plus
 # Latest git (git-core PPA, as on hosted runners), git-lfs and GitHub CLI.
 source "$(dirname "$0")/lib.sh"
 

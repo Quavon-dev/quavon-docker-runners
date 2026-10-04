@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# flavors: standard full
+# flavors: standard full full-plus
 # Node.js LTS (NodeSource) + npm, yarn, pnpm.
 source "$(dirname "$0")/lib.sh"
 

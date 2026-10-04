@@ -325,9 +325,9 @@ cmd_build() {
       *) die "unknown option $1" ;;
     esac
   done
-  [[ "$flavor" == standard || "$flavor" == full ]] || die "flavor must be 'standard' or 'full'"
+  [[ "$flavor" =~ ^(standard|full|full-plus)$ ]] || die "flavor must be 'standard', 'full' or 'full-plus'"
   local image="quavon/gha-runner:${flavor}"
-  info "Building ${image} - 'standard' takes ~5-10 min, 'full' ~20-40 min"
+  info "Building ${image} - 'standard' takes ~5-10 min, 'full' ~20-40 min, 'full-plus' ~30-50 min"
   DOCKER_BUILDKIT=1 docker build "${no_cache[@]}" --pull --progress=plain \
     --build-arg FLAVOR="$flavor" -t "$image" "${REPO_DIR}/image"
   sed -i -e "s|^RUNNER_FLAVOR=.*|RUNNER_FLAVOR=${flavor}|" -e "s|^RUNNER_IMAGE=.*|RUNNER_IMAGE=${image}|" \
@@ -394,7 +394,7 @@ gha-runners - Dockerized GitHub Actions runners
   start|stop|restart [name]  control one runner (default: all)
   logs <name> [-f]           runner logs (journald)
   shell <name>               open a shell inside a runner container
-  build [--flavor F] [--no-cache]  (re)build the runner image (standard|full)
+  build [--flavor F] [--no-cache]  (re)build the runner image (standard|full|full-plus)
   limits [--cpus N] [--memory MB]  show/change per-runner CPU/RAM caps
   update                     pull latest scripts, rebuild image, restart all
 EOF

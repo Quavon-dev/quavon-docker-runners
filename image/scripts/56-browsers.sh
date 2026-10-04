@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# flavors: full
+# flavors: full full-plus
 # Google Chrome + chromedriver, Firefox + geckodriver (for E2E / Playwright / Selenium).
 source "$(dirname "$0")/lib.sh"
 

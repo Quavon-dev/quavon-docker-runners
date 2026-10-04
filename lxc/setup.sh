@@ -58,6 +58,7 @@ setup_files() {
   install -d "$LIB_DIR" "$CONF_DIR" /srv/gha-runners
   install -m 0755 "${REPO_DIR}/lxc/run-container.sh" "${LIB_DIR}/run-container.sh"
   install -m 0755 "${REPO_DIR}/lxc/gha-runners" /usr/local/bin/gha-runners
+  install -m 0644 "${REPO_DIR}/lxc/seccomp/io-uring.json" "${LIB_DIR}/seccomp-io-uring.json"
   install -m 0644 "${REPO_DIR}"/lxc/systemd/* /etc/systemd/system/
   systemctl daemon-reload
   systemctl enable --now gha-runners-prune.timer >/dev/null

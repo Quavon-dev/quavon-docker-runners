@@ -41,6 +41,16 @@ if [[ -n "${RUNNER_MEM:-}" ]]; then
   if [[ "$can_mem" == true ]]; then limits+=(--memory "${RUNNER_MEM}m" --memory-swap "${RUNNER_MEM}m"); else echo "warning: memory limits unsupported here, skipping" >&2; fi
 fi
 
+# full-plus ships TigerBeetle, which needs io_uring. Docker's default seccomp
+# profile refuses it, so those runners use the default profile plus the three
+# io_uring calls (never unconfined). RUNNER_IO_URING=0 in config.env opts out.
+security=()
+seccomp_profile=/usr/local/lib/gha-runners/seccomp-io-uring.json
+if [[ "${RUNNER_FLAVOR:-}" == full-plus && "${RUNNER_IO_URING:-1}" != 0 ]]; then
+  if [[ -f "$seccomp_profile" ]]; then security+=(--security-opt "seccomp=${seccomp_profile}")
+  else echo "warning: ${seccomp_profile} missing, io_uring stays blocked (run: gha-runners update)" >&2; fi
+fi
+
 docker rm -f "gha-${name}" >/dev/null 2>&1 || true
 
 # --network host  : service containers / published ports reachable on localhost (like hosted)
@@ -59,6 +69,7 @@ exec docker run --rm --init --pull never \
   --group-add "$docker_gid" \
   --shm-size 2g \
   "${limits[@]}" \
+  "${security[@]}" \
   --env-file "$env_file" \
   "${token_env[@]}" \
   -v /var/run/docker.sock:/var/run/docker.sock \

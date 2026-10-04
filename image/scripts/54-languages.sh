@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# flavors: full
+# flavors: full full-plus
 # Ruby, PHP + Composer, C/C++ (clang), Fortran, Perl, database clients.
 source "$(dirname "$0")/lib.sh"
 

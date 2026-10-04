@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# flavors: full
+# flavors: full full-plus
 # Cloud CLIs: AWS CLI v2, Azure CLI, Google Cloud CLI; plus ansible and kind.
 source "$(dirname "$0")/lib.sh"
 codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"

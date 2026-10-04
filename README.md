@@ -16,7 +16,7 @@ The wizard asks for:
    read from it. The token is valid for **1 hour**, and runners are registered
    before the image build so a slow build can't outlast the token.
 2. **Runner mode.** See [Persistent vs. ephemeral](#persistent-vs-ephemeral).
-3. **Image flavor** (`standard` or `full`).
+3. **Image flavor** (`standard`, `full` or `full-plus`).
 4. **Parallel jobs.** How many runners you want, and whether they share one LXC
    or each get their own (see [Parallel jobs](#parallel-jobs)).
 5. **Size per runner** (`small` / `medium` / `large` / `xlarge` / `custom`;
@@ -60,7 +60,41 @@ jobs:
 | | PowerShell, Chrome + chromedriver, Firefox + geckodriver |
 | | AWS CLI v2, Azure CLI, Google Cloud CLI, ansible, kind |
 
-Change the flavor later with `gha-runners build --flavor full && gha-runners restart`.
+`full-plus` (~15 GB) is `full` plus a pinned backend/CI toolchain, so workflows don't
+download or `go install` these on every run. Every download is checked against its
+published SHA-256; the Go tools are built with `go install` at the exact tag.
+
+| Tool | Version |
+|---|---|
+| bun | 1.3.14 |
+| Valkey (`valkey-server`, `valkey-cli`; `redis-server`/`redis-cli` link to them) | 8.1.10 |
+| nats-server | v2.14.6 |
+| openfga | v1.19.0 |
+| goose | v3.27.3 |
+| OpenBao (`bao`) | 2.1.0 |
+| Temporal CLI | 1.8.2 |
+| TigerBeetle | 0.16.78 |
+| typst | 0.15.1 |
+| buf, protoc-gen-go, protoc-gen-connect-go | v1.47.2, v1.36.12, v1.20.0 |
+| golangci-lint | v2.12.2 |
+| gosec | v2.29.0 |
+| gitleaks | 8.30.1 |
+| actionlint | 1.7.12 |
+| kubeconform | 0.8.0 |
+| lsof | Ubuntu's |
+
+Versions and digests live in `image/scripts/58-ci-stack.sh`. Valkey isn't started
+as a service, so nothing holds port 6379.
+
+**io_uring.** TigerBeetle needs io_uring, and Docker's default seccomp profile
+blocks it. `full-plus` runners therefore run under Docker's default profile plus
+`io_uring_setup`, `io_uring_enter` and `io_uring_register`
+(`lxc/seccomp/io-uring.json`), never `unconfined`. io_uring has a history of kernel
+bugs, so this widens the attack surface a little for jobs on these runners. To turn it
+off, add `RUNNER_IO_URING=0` to `/etc/gha-runners/config.env` and run `gha-runners restart`.
+
+Change the flavor later with `gha-runners build --flavor full && gha-runners restart`
+(or `--flavor full-plus`).
 
 Invalid input never aborts the wizard: the prompt explains what's wrong and asks
 again. Labels are cleaned up automatically, so `docker, linux` becomes `docker`
@@ -87,7 +121,7 @@ any further jobs wait in GitHub's queue. You choose where the runners live:
 | `shared` (default) | 1 LXC, *N* runners, one Docker, disk and image | trusted repos; least overhead |
 | `separate` | *N* LXCs, 1 runner each, each with its own firewall and Docker | untrusted or mixed repos; jobs fully isolated from each other |
 
-`separate` costs about 0.5 GB of RAM plus one image copy (~3 GB or ~13 GB of disk)
+`separate` costs about 0.5 GB of RAM plus one image copy (~3, ~13 or ~15 GB of disk)
 per extra container. The image is built only once and copied to the others. All
 runners are registered before the build, so the 1-hour pair code doesn't expire.
 With a static IP, the address is counted up per container (`.50`, `.51`, …).
@@ -142,7 +176,7 @@ and the runner count:
 LXC totals:
 - **CPU:** runners × CPU, capped at the host's cores.
 - **RAM:** runners × RAM, plus 1 GB for the OS.
-- **Disk:** 2 GB OS, plus the image (`standard` ~3 GB, `full` ~13 GB), plus runners × (1 GB + job disk).
+- **Disk:** 2 GB OS, plus the image (`standard` ~3 GB, `full` ~13 GB, `full-plus` ~15 GB), plus runners × (1 GB + job disk).
 
 For example, 2 × `medium` with `standard` gives 4 cores, 9 GB RAM and 19 GB disk.
 In advanced mode you can override every total.
@@ -182,7 +216,7 @@ gha-runners remove <name>               # deregister (asks for the removal token
 gha-runners logs <name> -f              # live logs
 gha-runners restart [name]              # restart one or all
 gha-runners shell <name>                # shell inside a runner container
-gha-runners build [--flavor full]       # rebuild the image
+gha-runners build [--flavor F]          # rebuild the image
 gha-runners limits [--cpus N --memory MB]  # per-runner CPU/RAM caps
 gha-runners update                      # pull latest scripts, rebuild, restart
 ```
@@ -262,7 +296,8 @@ lxc/setup.sh               provisioning inside the LXC (Docker, CLI, registratio
 lxc/gha-runners            management CLI
 lxc/run-container.sh       docker run wrapper used by gha-runner@.service
 lxc/systemd/               runner template unit + daily prune timer
-image/Dockerfile           runner image (FLAVOR=standard|full)
+lxc/seccomp/io-uring.json  seccomp profile for full-plus runners (Docker default + io_uring)
+image/Dockerfile           runner image (FLAVOR=standard|full|full-plus)
 image/scripts/NN-*.sh      one build step per toolchain ("# flavors:" header)
 image/entrypoint.sh        ephemeral re-registration, env capture, run.sh
 image/hooks/               job-started / job-completed cleanup hooks

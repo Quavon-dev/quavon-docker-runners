@@ -478,7 +478,8 @@ ${RUNNER_COUNT} runner(s) in $(ct_count) container(s). Host: $(host_cpus) CPUs, 
 # Container totals (per container). CPU/RAM are limits, not reservations, and
 # LVM-thin/ZFS disks are thin-provisioned, so unused headroom costs nothing.
 size_defaults() {   # size_defaults <job disk GB per runner>
-  local image_gb=3 per; [[ "$RUNNER_FLAVOR" == full ]] && image_gb=13
+  local image_gb=3 per
+  case "$RUNNER_FLAVOR" in full) image_gb=13 ;; full-plus) image_gb=15 ;; esac
   per="$(runners_per_ct)"
   local cpus=$((per * RUNNER_CPUS))
   (( cpus > $(host_cpus) )) && cpus="$(host_cpus)"   # can't exceed host; runners share
@@ -520,7 +521,8 @@ With ${RUNNER_COUNT} containers, a static IP is counted up (.50, .51, ...)."
 ask_settings() {
   RUNNER_FLAVOR="$(w_menu "Runner image" "$RUNNER_FLAVOR" \
     standard "git, gh, Docker, Python, Node, build tools, kubectl, helm (~3 GB)" \
-    full     "standard + Go, Java, .NET, Rust, PHP, Ruby, pwsh, browsers, clouds (~13 GB)")"
+    full     "standard + Go, Java, .NET, Rust, PHP, Ruby, pwsh, browsers, clouds (~13 GB)" \
+    full-plus "full + pinned CI stack: bun, Valkey, NATS, OpenBao... (~15 GB)")"
   ask_parallel
   ask_size
 
@@ -1084,7 +1086,7 @@ provision_ct() {   # provision_ct <index>
 build_image() {   # build_image <ctid>
   local id="$1" rc choice
   while true; do
-    msg_info "Building '${RUNNER_FLAVOR}' image (standard ~5-10 min, full ~20-40 min)" '.*### step '
+    msg_info "Building '${RUNNER_FLAVOR}' image (standard ~5-10 min, full ~20-40 min, full-plus ~30-50 min)" '.*### step '
     rc=0
     run ct "$id" /usr/local/bin/gha-runners build --flavor "$RUNNER_FLAVOR" || rc=$?
     if [[ "$rc" == 0 ]]; then msg_ok "Built runner image quavon/gha-runner:${RUNNER_FLAVOR}"; return 0; fi
@@ -1092,7 +1094,7 @@ build_image() {   # build_image <ctid>
     show_log_tail
     [[ "$NONINTERACTIVE" == 1 ]] && exit "$rc"
     local alt=()
-    [[ "$RUNNER_FLAVOR" == full ]] && alt=(standard "Use the 'standard' image instead (switch to full later: gha-runners build --flavor full)")
+    [[ "$RUNNER_FLAVOR" == full* ]] && alt=(standard "Use the 'standard' image instead (switch later: gha-runners build --flavor ${RUNNER_FLAVOR})")
     choice="$(w_menu "The runner image could not be built (output above / in ${LOG_FILE}).
 
 Container(s) and GitHub registration are fine." retry \

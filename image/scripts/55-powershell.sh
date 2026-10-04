@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# flavors: full
+# flavors: full full-plus
 # PowerShell (pwsh) from the Microsoft repo, so `shell: pwsh` steps work.
 source "$(dirname "$0")/lib.sh"
 

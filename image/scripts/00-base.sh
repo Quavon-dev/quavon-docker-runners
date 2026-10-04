@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# flavors: standard full
+# flavors: standard full full-plus
 # Core OS packages, runner user, locale and tool cache - mirrors the base
 # layer of GitHub's ubuntu-24.04 hosted image.
 source "$(dirname "$0")/lib.sh"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# flavors: full
+# flavors: full full-plus
 # Eclipse Temurin 11/17/21/25 (default 17, like hosted), Maven, Gradle, Ant.
 source "$(dirname "$0")/lib.sh"
 

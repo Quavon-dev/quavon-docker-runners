@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# flavors: full
+# flavors: full full-plus
 # .NET SDKs 8, 9, 10 in /usr/share/dotnet (same location as hosted).
 source "$(dirname "$0")/lib.sh"
 

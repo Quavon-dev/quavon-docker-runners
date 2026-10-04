@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# flavors: full
+# flavors: full full-plus
 # Rust stable via rustup, owned by the runner user so jobs can add targets.
 source "$(dirname "$0")/lib.sh"
 

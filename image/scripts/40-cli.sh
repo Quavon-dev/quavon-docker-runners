@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# flavors: standard full
+# flavors: standard full full-plus
 # Common CLIs: yq, kubectl, helm.
 source "$(dirname "$0")/lib.sh"
 

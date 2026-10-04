@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# flavors: standard full
+# flavors: standard full full-plus
 # Image metadata, ownership fix-ups and cleanup.
 source "$(dirname "$0")/lib.sh"
 
