@@ -1,9 +1,9 @@
 [Unit]
-Description=Daily Docker cleanup for GitHub Actions runners
+Description=Hourly Docker cleanup for GitHub Actions runners
 
 [Timer]
-OnCalendar=daily
-RandomizedDelaySec=1h
+OnCalendar=hourly
+RandomizedDelaySec=10min
 Persistent=true
 
 [Install]

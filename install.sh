@@ -411,6 +411,7 @@ defaults() {
   VLAN="${VLAN:-}"
   UNPRIVILEGED="${UNPRIVILEGED:-1}"
   CPU_UNITS="${CPU_UNITS:-50}"
+  ZFS_SYNC="${ZFS_SYNC:-disabled}"
   SSH_KEYS="${SSH_KEYS:-}"
   NET_ISOLATION="${NET_ISOLATION:-internet}"
   DNS_SERVERS="${DNS_SERVERS:-1.1.1.1 9.9.9.9}"
@@ -589,6 +590,7 @@ validate_settings() {
   local n
   for n in CORES RAM SWAP DISK RUNNER_CPUS RUNNER_MEM; do valid_posint "${!n}" || die "$n must be a positive number"; done
   { valid_posint "$CPU_UNITS" && (( CPU_UNITS <= 10000 )); } || die "CPU_UNITS must be 1-10000"
+  [[ "$ZFS_SYNC" == disabled || "$ZFS_SYNC" == standard ]] || die "ZFS_SYNC must be disabled|standard"
   valid_count "$RUNNER_COUNT" || die "Runner count must be 1-32"
   [[ "$LAYOUT" == shared || "$LAYOUT" == separate ]] || die "LAYOUT must be shared|separate"
   [[ "$NET_ISOLATION" == internet || "$NET_ISOLATION" == lan ]] || die "NET_ISOLATION must be internet|lan"
@@ -715,6 +717,20 @@ GitHub: ${GH_URL}"
   step "Creating LXC container ${CTID}" \
     "Created LXC ${CTID} (${CUR_HOSTNAME}: ${CORES} cores, ${RAM} MB, ${DISK} GB)" \
     -- pct create "$CTID" "$TEMPLATE" "${args[@]}"
+}
+
+disable_zfs_sync() {
+  [[ "$ZFS_SYNC" == disabled ]] || return 0
+  [[ "$(timeout 30 pvesm status -storage "$ROOT_STORAGE" 2>/dev/null | awk -v s="$ROOT_STORAGE" '$1 == s { print $2 }')" == zfspool ]] \
+    || return 0
+  local volid dataset
+  if ! volid="$(pct config "$CTID" | sed -n 's/^rootfs: \([^,]*\).*/\1/p')" \
+     || ! dataset="$(zfs list -H -o name "$(pvesm path "$volid")")"; then
+    msg_warn "Could not find the ZFS dataset of container ${CTID}; sync writes stay on"
+    return 0
+  fi
+  step "Turning off ZFS sync writes" "ZFS sync writes off for ${dataset} (CI data is disposable)" \
+    -- zfs set sync=disabled "$dataset"
 }
 
 # ------------------------------------------------------------------ firewall --
@@ -1084,6 +1100,7 @@ provision_ct() {   # provision_ct <index>
   CTID="${PLAN_IDS[$1]}" CUR_HOSTNAME="${PLAN_NAMES[$1]}" CUR_IP="${PLAN_IPS[$1]}" CUR_PREFIX="${PLAN_PREFIXES[$1]}"
   printf '\n %s[%s/%s] Container %s (%s)%s\n' "$BL" "$(( $1 + 1 ))" "$(ct_count)" "$CTID" "$CUR_HOSTNAME" "$CL"
   create_ct
+  disable_zfs_sync
   setup_firewall
   start_ct
   verify_isolation

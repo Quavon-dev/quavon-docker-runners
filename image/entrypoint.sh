@@ -5,7 +5,7 @@
 # Optional env:  RUNNER_LABELS  RUNNER_GROUP  RUNNER_EPHEMERAL=1 + RUNNER_TOKEN
 set -Eeuo pipefail
 
-die() { echo "entrypoint: $*" >&2; exit 1; }
+die() { echo "entrypoint: $*" >&2; sleep 10; exit 1; }
 
 : "${RUNNER_DIR:?RUNNER_DIR is required}"
 : "${GITHUB_URL:?GITHUB_URL is required}"

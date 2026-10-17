@@ -11,7 +11,11 @@ case "$cmd" in
   destroy) sed -i "/^$1\$/d" "$S/ids"; echo "destroyed $1" >>"$S/destroyed" ;;
   push) cp "$2" "$S/ct-$1-bootstrap" ;;
   list) echo "VMID       Status     Lock         Name" ;;
-  status|config) exit 2 ;;
+  status) exit 2 ;;
+  config)
+    st="$(grep -A1 -x -- --rootfs "$S/ct-$1.create" 2>/dev/null | tail -n1)"
+    [[ -n "$st" ]] || exit 2
+    echo "rootfs: ${st%%:*}:subvol-$1-disk-0,size=${st##*:}G" ;;
   exec)
     id="$1"; shift; [[ "$1" == -- ]] && shift
     # install.sh prefixes "env PATH=... LANG=... "; record it, then drop it

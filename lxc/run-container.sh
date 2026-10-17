@@ -7,12 +7,12 @@ name="${1:?runner name required}"
 CONF_DIR=/etc/gha-runners
 env_file="${CONF_DIR}/runners/${name}.env"
 
-[[ -f "$env_file" ]] || { echo "no config for runner '$name' ($env_file)" >&2; exit 1; }
+[[ -f "$env_file" ]] || { echo "no config for runner '$name' ($env_file)" >&2; sleep 10; exit 1; }
 # shellcheck source=/dev/null
 source "${CONF_DIR}/config.env"
 
 runner_dir="$(sed -n 's/^RUNNER_DIR=//p' "$env_file")"
-[[ -d "$runner_dir" ]] || { echo "runner dir missing: $runner_dir" >&2; exit 1; }
+[[ -d "$runner_dir" ]] || { echo "runner dir missing: $runner_dir" >&2; sleep 10; exit 1; }
 
 docker_gid="$(stat -c %g /var/run/docker.sock)"
 

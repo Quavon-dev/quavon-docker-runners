@@ -46,7 +46,7 @@ jobs:
 | Docker in jobs | `docker build/run`, `services:`, `container:` jobs, buildx, compose |
 | Networking | `--network host`, so `services:` ports work on `localhost` like on hosted runners |
 | Hosted-runner parity | user `runner` (uid 1001) with passwordless `sudo`, `/opt/hostedtoolcache`, `ImageOS=ubuntu24`, so `actions/setup-*` work |
-| Cleanup | workspace wiped before each job, file ownership fixed after container jobs, daily Docker prune, build cache capped at a quarter of the disk |
+| Cleanup | containers a job left running (`docker run -d`, `compose up -d`) removed before the next job, workspace wiped, file ownership fixed after container jobs, hourly Docker prune, build cache capped at a quarter of the disk |
 
 ### Image flavors
 
@@ -188,7 +188,7 @@ In advanced mode you can override every total.
 
 CPU and RAM are **limits, not reservations**: an idle runner uses about 150 MB.
 On LVM-thin and ZFS the disk is thin-provisioned, so only data actually written
-takes space. Unused job images are pruned daily.
+takes space. Unused job images are pruned once the disk is 80% full (checked hourly).
 
 The runner LXCs get `cpuunits 50` (Proxmox default: 100). When the host is busy,
 your other VMs and containers get twice the CPU share of CI jobs. Set
@@ -207,6 +207,14 @@ workflows.
 `native` storage driver. Those copy the whole runner image for every container.
 On ZFS this happens before Proxmox VE 8.1 (ZFS 2.2). Upgrade, or put the container
 on LVM-thin or directory storage.
+
+**ZFS sync writes.** On ZFS storage the installer sets `sync=disabled` on the
+container's dataset. `dpkg`, `npm`, image extraction and database service containers
+force writes to disk all the time, and on ZFS that's often the slowest part of a job.
+If the host crashes, the last ~5 seconds of writes are lost. ZFS itself stays
+consistent, and CI data can be recreated. Set `ZFS_SYNC=standard` to keep sync writes. For
+existing containers, on the host: `zfs list | grep subvol-<CTID>`, then
+`zfs set sync=disabled <dataset>`.
 
 Change limits later:
 
@@ -239,6 +247,8 @@ gha-runners restart [name]              # restart one or all
 gha-runners shell <name>                # shell inside a runner container
 gha-runners build [--flavor F]          # rebuild the image
 gha-runners limits [--cpus N --memory MB]  # per-runner CPU/RAM caps
+gha-runners doctor                      # storage driver, disk, CPU throttling and OOM kills per runner
+gha-runners prune [--all]               # Docker cleanup (runs hourly; --all removes every unused image now)
 gha-runners update                      # pull latest scripts, rebuild, restart
 ```
 
@@ -259,7 +269,7 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/quavon-dev/quavon-docker
 Other variables: `LAYOUT=shared|separate`, `SIZE=custom` with `RUNNER_CPUS` / `RUNNER_MEM`, `CORES` / `RAM` / `DISK`
 (override the totals), `NET_ISOLATION=internet|lan`, `DNS_SERVERS`, `LAN_ALLOW=10.0.0.5,10.0.10.0/24`,
 `RUNNER_MODE=ephemeral` with `GH_PAT`, `RUNNER_PREFIX`, `RUNNER_GROUP`,
-`CT_HOSTNAME`, `SWAP`, `CPU_UNITS` (CPU priority, 1-10000, default 50), `BRIDGE`, `NET_IP` / `NET_GW`, `VLAN`, `SSH_KEYS`, `UNPRIVILEGED`,
+`CT_HOSTNAME`, `SWAP`, `CPU_UNITS` (CPU priority, 1-10000, default 50), `ZFS_SYNC=disabled|standard`, `BRIDGE`, `NET_IP` / `NET_GW`, `VLAN`, `SSH_KEYS`, `UNPRIVILEGED`,
 `REPO_URL` / `REPO_BRANCH` (forks).
 
 For a private fork, clone it on the Proxmox host and run `./install.sh`. The local
@@ -316,7 +326,7 @@ install.sh                 Proxmox host wizard (pct create / push / exec)
 lxc/setup.sh               provisioning inside the LXC (Docker, CLI, registration)
 lxc/gha-runners            management CLI
 lxc/run-container.sh       docker run wrapper used by gha-runner@.service
-lxc/systemd/               runner template unit + daily prune timer
+lxc/systemd/               runner template unit + hourly prune timer
 lxc/seccomp/io-uring.json  seccomp profile for full-plus runners (Docker default + io_uring)
 image/Dockerfile           runner image (FLAVOR=standard|full|full-plus)
 image/scripts/NN-*.sh      one build step per toolchain ("# flavors:" header)

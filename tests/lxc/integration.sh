@@ -106,9 +106,14 @@ grep -iE "listening|connected|error|exception" /tmp/runner-journal.log | head -4
 
 section "job hooks"
 docker exec "gha-$name" bash -c "sudo mkdir -p $dir/_work/other && sudo touch $dir/_work/other/root-file"
+docker run -d --name itest-leftover -v "$dir/_work/t:/w" busybox sleep 600 >/dev/null
+docker run -d --name itest-unrelated -v /tmp:/w busybox sleep 600 >/dev/null
 docker exec -e GITHUB_WORKSPACE="$dir/_work/t" "gha-$name" /opt/gha/hooks/job-started.sh >/dev/null 2>&1
 chk "job-started hook empties workspace" '[[ -z "$(ls -A "$dir/_work/t" 2>/dev/null)" ]]'
 chk "job-started hook hands root-owned files back" '[[ $(stat -c %u:%g "$dir/_work/other/root-file") == 1001:1001 ]]'
+chk "job-started hook removes containers left by earlier jobs" '! docker inspect itest-leftover >/dev/null 2>&1'
+chk "job-started hook keeps unrelated containers" 'docker inspect itest-unrelated >/dev/null 2>&1'
+docker rm -f itest-leftover itest-unrelated >/dev/null 2>&1
 
 section "CLI"
 gha-runners list >/tmp/list.log 2>&1
@@ -120,6 +125,16 @@ chk "parallelism hints follow the new cap" 'docker inspect gha-$name 2>/dev/null
 gha-runners limits --cpus 999 >/dev/null 2>&1
 sleep 6
 chk "cpu cap above the LXC's cores is clamped" 'docker inspect gha-$name 2>/dev/null | grep -q "\"NanoCpus\": $(nproc)000000000"'
+gha-runners doctor >/tmp/doctor.log 2>&1; rc=$?
+chk "doctor reads the runner's cgroup (rc=$rc)" '[[ $rc == 0 ]] && grep -q "storage driver" /tmp/doctor.log && grep -qE "^$name +[0-9]+%" /tmp/doctor.log'
+gha-runners stop "$name" >/dev/null 2>&1
+docker tag quavon/gha-runner:standard quavon/gha-runner:full
+gha-runners prune --all >/tmp/prune.log 2>&1; rc=$?
+chk "prune --all succeeds (rc=$rc)" '[[ $rc == 0 ]]'
+chk "prune keeps the runner image with runners stopped" 'docker image inspect quavon/gha-runner:standard >/dev/null 2>&1'
+chk "prune drops unused job images" '! docker image inspect busybox >/dev/null 2>&1'
+chk "prune drops runner images of other flavors" '! docker image inspect quavon/gha-runner:full >/dev/null 2>&1'
+chk "hourly prune service runs" 'systemctl start gha-runners-prune.service'
 if [[ -z "${GH_TEST_TOKEN:-}" ]]; then
   gha-runners remove "$name" </dev/null >/tmp/remove.log 2>&1
   chk "remove cleans up locally" '[[ ! -e $dir && ! -e /etc/gha-runners/runners/$name.env ]] && ! docker inspect gha-$name >/dev/null 2>&1'

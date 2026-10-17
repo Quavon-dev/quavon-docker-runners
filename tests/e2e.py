@@ -198,6 +198,7 @@ def case_happy_shared():
     for arg in ["--cores\n4", "--memory\n9216", "--cpuunits\n50", "local-lvm:19", "nesting=1,keyctl=1,fuse=1",
                 "--unprivileged\n1", "firewall=1", "--nameserver\n1.1.1.1 9.9.9.9", "github-runner"]:
         check(arg in create, f"pct create missing {arg!r}")
+    check("zfs " not in calls(), "ZFS tuning ran on LVM-thin storage")
     fw = read("/etc/pve/firewall/100.fw")
     check("policy_in: DROP" in fw and "OUT REJECT -dest +lan_block" in fw and "8000::/1" in fw, "firewall rules wrong")
     boot = read(f"{STATE}/ct-100-bootstrap")
@@ -274,6 +275,7 @@ def case_separate_static_ip():
         check(read(f"{STATE}/ct-{ctid}-runners").split() == [f"gha-runners-{n}"], f"CT {ctid} runner wrong")
         check(os.path.exists(f"{STATE}/ct-{ctid}-image"), f"image missing in {ctid}")
         check("10.0.0.5" in read(f"/etc/pve/firewall/{ctid}.fw"), "LAN exception missing")
+        check(f"zfs set sync=disabled tank/subvol-{ctid}-disk-0" in calls(), f"ZFS sync writes not disabled for {ctid}")
     check(calls().count("gha-runners build") == 1, "image must be built once and copied")
     check("Copied image to container 103" in out and "Copied image to container 104" in out, "image copy not shown")
 

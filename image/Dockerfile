@@ -12,6 +12,8 @@
 # self-update and so container jobs get correct host paths.
 FROM ubuntu:24.04
 
+LABEL com.quavon.gha-runner=true
+
 ARG FLAVOR=standard
 ARG NODE_MAJOR=22
 
@@ -19,6 +21,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LANG=en_US.UTF-8 \
     LC_ALL=en_US.UTF-8 \
     RUNNER_FLAVOR=${FLAVOR} \
+    RUNNER_LOGRETENTION=7 \
+    WORKER_LOGRETENTION=7 \
     ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/gha/hooks/job-started.sh \
     ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/opt/gha/hooks/job-completed.sh
 
