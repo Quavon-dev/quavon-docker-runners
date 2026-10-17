@@ -25,6 +25,8 @@ bash "$REPO/lxc/setup.sh" docker >/tmp/docker.log 2>&1; rc=$?
 chk "docker installed + test container ran (rc=$rc)" '[[ $rc == 0 ]]'
 chk "docker daemon active" 'systemctl is-active --quiet docker'
 chk "log rotation configured" 'grep -q max-size /etc/docker/daemon.json'
+chk "build cache capped" 'jq -e ".builder.gc.defaultMaxUsedSpace" /etc/docker/daemon.json >/dev/null'
+chk "existing daemon.json settings kept" 'jq -e ".\"storage-driver\" == \"overlay2\"" /etc/docker/daemon.json >/dev/null'
 
 section "setup.sh register (with an invalid token: must fail cleanly)"
 cat >/root/.gha-bootstrap.env <<B
@@ -88,6 +90,7 @@ chk "host network" 'grep -q "\"NetworkMode\": \"host\"" <<<"$insp"'
 chk "docker socket mounted" 'grep -q "/var/run/docker.sock:/var/run/docker.sock" <<<"$insp"'
 chk "runner dir at identical path" 'grep -q "\"$dir:$dir\"" <<<"$insp"'
 chk "cpu/memory caps applied" 'grep -q "\"NanoCpus\": 2000000000" <<<"$insp" && grep -q "\"Memory\": 2147483648" <<<"$insp"'
+chk "parallelism hints match the cpu cap" 'grep -q "\"GOMAXPROCS=2\"" <<<"$insp" && grep -q "\"PYTEST_XDIST_AUTO_NUM_WORKERS=2\"" <<<"$insp"'
 chk "no PAT/token in container env" '! grep -qE "GITHUB_PAT|GHA_TOKEN" <<<"$insp"'
 docker exec "gha-$name" bash -lc 'id; docker version --format "docker-cli {{.Client.Version}} / daemon {{.Server.Version}}"; sudo -n true && echo sudo-ok' >/tmp/inrunner.log 2>&1
 chk "docker usable from runner container" 'grep -q "daemon" /tmp/inrunner.log'
@@ -102,8 +105,10 @@ chk "runner process actually launched (Runner.Listener)" 'grep -qiE "Runner|List
 grep -iE "listening|connected|error|exception" /tmp/runner-journal.log | head -4 | sed 's/^/     /'
 
 section "job hooks"
+docker exec "gha-$name" bash -c "sudo mkdir -p $dir/_work/other && sudo touch $dir/_work/other/root-file"
 docker exec -e GITHUB_WORKSPACE="$dir/_work/t" "gha-$name" /opt/gha/hooks/job-started.sh >/dev/null 2>&1
 chk "job-started hook empties workspace" '[[ -z "$(ls -A "$dir/_work/t" 2>/dev/null)" ]]'
+chk "job-started hook hands root-owned files back" '[[ $(stat -c %u:%g "$dir/_work/other/root-file") == 1001:1001 ]]'
 
 section "CLI"
 gha-runners list >/tmp/list.log 2>&1
@@ -111,6 +116,10 @@ chk "gha-runners list shows runner" 'grep -q "$name" /tmp/list.log'
 gha-runners limits --cpus 1 --memory 1024 >/dev/null 2>&1
 sleep 6
 chk "limits change applied after restart" 'docker inspect gha-$name 2>/dev/null | grep -q "\"Memory\": 1073741824"'
+chk "parallelism hints follow the new cap" 'docker inspect gha-$name 2>/dev/null | grep -q "\"GOMAXPROCS=1\""'
+gha-runners limits --cpus 999 >/dev/null 2>&1
+sleep 6
+chk "cpu cap above the LXC's cores is clamped" 'docker inspect gha-$name 2>/dev/null | grep -q "\"NanoCpus\": $(nproc)000000000"'
 if [[ -z "${GH_TEST_TOKEN:-}" ]]; then
   gha-runners remove "$name" </dev/null >/tmp/remove.log 2>&1
   chk "remove cleans up locally" '[[ ! -e $dir && ! -e /etc/gha-runners/runners/$name.env ]] && ! docker inspect gha-$name >/dev/null 2>&1'

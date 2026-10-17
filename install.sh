@@ -410,6 +410,7 @@ defaults() {
   NET_GW="${NET_GW:-}"
   VLAN="${VLAN:-}"
   UNPRIVILEGED="${UNPRIVILEGED:-1}"
+  CPU_UNITS="${CPU_UNITS:-50}"
   SSH_KEYS="${SSH_KEYS:-}"
   NET_ISOLATION="${NET_ISOLATION:-internet}"
   DNS_SERVERS="${DNS_SERVERS:-1.1.1.1 9.9.9.9}"
@@ -442,13 +443,13 @@ Example: 3 = up to 3 jobs (e.g. build, test, lint) in parallel." \
 
   LAYOUT="$(w_menu "Where should the ${RUNNER_COUNT} runners live?
 
-shared   : 1 container, ${RUNNER_COUNT} runners. They share Docker, disk and the
-           image. Least overhead. A job could see/affect the other runners.
-separate : ${RUNNER_COUNT} containers, 1 runner each. Jobs fully isolated from each
-           other, each with its own firewall. ~0.5 GB RAM + one image copy
-           (~3/13 GB disk) extra per container." "$LAYOUT" \
-    shared   "1 LXC with ${RUNNER_COUNT} runners (trusted repos, recommended)" \
-    separate "${RUNNER_COUNT} LXCs with 1 runner each (untrusted / mixed repos)")"
+shared   : 1 container, ${RUNNER_COUNT} runners sharing Docker, disk and image. Least
+           overhead, but docker build, services: and container: jobs are
+           not capped per runner and can starve the other runners.
+separate : ${RUNNER_COUNT} containers, 1 runner each, each with its own firewall and
+           limits covering all a job starts. +0.5 GB RAM, +1 image each." "$LAYOUT" \
+    shared   "1 LXC with ${RUNNER_COUNT} runners (light jobs, trusted repos)" \
+    separate "${RUNNER_COUNT} LXCs with 1 runner each (Docker builds, heavy/untrusted)")"
 }
 
 runners_per_ct() { [[ "$LAYOUT" == separate ]] && echo 1 || echo "$RUNNER_COUNT"; }
@@ -481,8 +482,8 @@ size_defaults() {   # size_defaults <job disk GB per runner>
   local image_gb=3 per
   case "$RUNNER_FLAVOR" in full) image_gb=13 ;; full-plus) image_gb=15 ;; esac
   per="$(runners_per_ct)"
-  local cpus=$((per * RUNNER_CPUS))
-  (( cpus > $(host_cpus) )) && cpus="$(host_cpus)"   # can't exceed host; runners share
+  local cpus=$((per * RUNNER_CPUS)) max_cpus=$(( $(host_cpus) > 1 ? $(host_cpus) - 1 : 1 ))
+  (( cpus > max_cpus )) && cpus="$max_cpus"
   CORES="${CORES:-$cpus}"
   RAM="${RAM:-$((per * RUNNER_MEM + 1024))}"
   SWAP="${SWAP:-1024}"
@@ -587,6 +588,7 @@ validate_settings() {
   valid_name "$RUNNER_PREFIX" || die "Invalid runner name: $RUNNER_PREFIX"
   local n
   for n in CORES RAM SWAP DISK RUNNER_CPUS RUNNER_MEM; do valid_posint "${!n}" || die "$n must be a positive number"; done
+  { valid_posint "$CPU_UNITS" && (( CPU_UNITS <= 10000 )); } || die "CPU_UNITS must be 1-10000"
   valid_count "$RUNNER_COUNT" || die "Runner count must be 1-32"
   [[ "$LAYOUT" == shared || "$LAYOUT" == separate ]] || die "LAYOUT must be shared|separate"
   [[ "$NET_ISOLATION" == internet || "$NET_ISOLATION" == lan ]] || die "NET_ISOLATION must be internet|lan"
@@ -607,6 +609,15 @@ That works (they are only limits), but parallel heavy jobs could make the
 host swap.
 
 Continue anyway?" 0 || die "Choose a smaller size or fewer runners."
+  fi
+
+  local total_cpus=$(( CORES * $(ct_count) ))
+  if (( total_cpus > $(host_cpus) )); then
+    w_yesno "The CPU limits add up to ${total_cpus} cores, more than the host's $(host_cpus).
+Runners get a lower CPU priority than your other guests (cpuunits ${CPU_UNITS}),
+but heavy jobs running at the same time will slow each other down.
+
+Continue anyway?" 1 || die "Choose a smaller size or fewer runners."
   fi
 }
 
@@ -682,7 +693,7 @@ create_ct() {   # uses CTID, CUR_HOSTNAME, CUR_IP
 
   local args=(
     --hostname "$CUR_HOSTNAME"
-    --cores "$CORES" --memory "$RAM" --swap "$SWAP"
+    --cores "$CORES" --memory "$RAM" --swap "$SWAP" --cpuunits "$CPU_UNITS"
     --rootfs "${ROOT_STORAGE}:${DISK}"
     --net0 "$net"
     --features "$([[ $UNPRIVILEGED == 1 ]] && echo nesting=1,keyctl=1,fuse=1 || echo nesting=1,fuse=1)"
@@ -1159,7 +1170,7 @@ summary() {
   done
   local shared_note=""
   [[ "$LAYOUT" == shared && "$RUNNER_COUNT" -gt 1 ]] \
-    && shared_note="Runners in the same LXC can affect each other - use LAYOUT=separate for untrusted code."
+    && shared_note="Runners in the same LXC can affect each other - use LAYOUT=separate for heavy or untrusted jobs."
   cat <<SUMMARY
 
 ${GN}${APP} are online: ${RUNNER_COUNT} runner(s) = ${RUNNER_COUNT} job(s) in parallel.${CL}

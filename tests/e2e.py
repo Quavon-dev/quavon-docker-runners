@@ -161,6 +161,7 @@ def wizard(labels="docker, linux", count="2", extra=()):
         (r"Runner name as shown", ENTER),
         (r"Extra labels", CLEAR + labels + ENTER),
         (r"Runner group", ENTER),
+        (r"CPU limits add up", ENTER),
         (r"Ready to create", ENTER),
     ]
 
@@ -194,7 +195,7 @@ def case_happy_shared():
         check(f"✔ {line}" in out, f"missing check mark: {line}")
     check("✖" not in out, "unexpected failure mark")
     create = read(f"{STATE}/ct-100.create")
-    for arg in ["--cores\n4", "--memory\n9216", "local-lvm:19", "nesting=1,keyctl=1,fuse=1",
+    for arg in ["--cores\n4", "--memory\n9216", "--cpuunits\n50", "local-lvm:19", "nesting=1,keyctl=1,fuse=1",
                 "--unprivileged\n1", "firewall=1", "--nameserver\n1.1.1.1 9.9.9.9", "github-runner"]:
         check(arg in create, f"pct create missing {arg!r}")
     fw = read("/etc/pve/firewall/100.fw")
@@ -437,6 +438,15 @@ def case_noninteractive():
     check("RUNNER_LABELS=docker\\,ci" in read(f"{STATE}/ct-100-bootstrap") or "RUNNER_LABELS=docker,ci" in read(f"{STATE}/ct-100-bootstrap"), "labels")
     check("--cores\n1" in read(f"{STATE}/ct-101.create") and "--memory\n3072" in read(f"{STATE}/ct-101.create"), "small size per CT")
     assert_no_secret_leak()
+
+
+def case_invalid_cpu_units_rejected():
+    reset_host()
+    r = subprocess.run(["bash", "-c", open(f"{ROOT}/install.sh").read()], cwd="/tmp", capture_output=True, text=True,
+                       timeout=60, env=env(NONINTERACTIVE=1, GH_URL="https://github.com/quavon-dev/app",
+                                           GH_TOKEN=TOKEN, CPU_UNITS=0))
+    check(r.returncode != 0 and "CPU_UNITS must be 1-10000" in clean(r.stdout + r.stderr), "CPU_UNITS=0 accepted")
+    check(read(f"{STATE}/ids").split() == [], "container created despite invalid CPU_UNITS")
 
 
 def case_local_checkout_is_copied():

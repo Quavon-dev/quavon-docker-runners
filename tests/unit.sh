@@ -45,7 +45,10 @@ t "size shared 2x medium"      "$CORES $RAM $DISK" "4 9216 19"
 RUNNER_COUNT=3 LAYOUT=separate; unset CORES RAM SWAP DISK; size_defaults 6
 t "size separate per CT"       "$CORES $RAM $DISK" "2 5120 12"
 RUNNER_COUNT=8 LAYOUT=shared RUNNER_CPUS=4; unset CORES RAM SWAP DISK; size_defaults 10
-t "cpu clamped to host"        "$CORES" "8"
+t "cpu leaves a host core"     "$CORES" "7"
+host_cpus() { echo 1; }; unset CORES RAM SWAP DISK; size_defaults 10
+t "cpu on a 1-core host"       "$CORES" "1"
+host_cpus() { echo 8; }
 RUNNER_FLAVOR=full-plus RUNNER_COUNT=2 RUNNER_CPUS=2; unset CORES RAM SWAP DISK; size_defaults 6
 t "size full-plus image"       "$DISK" "31"
 RUNNER_FLAVOR=standard

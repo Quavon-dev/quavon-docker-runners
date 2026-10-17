@@ -40,13 +40,13 @@ jobs:
 
 | | |
 |---|---|
-| LXC | Debian 13 (falls back to 12), unprivileged, `nesting,keyctl,fuse`, starts on boot |
+| LXC | Debian 13 (falls back to 12), unprivileged, `nesting,keyctl,fuse`, starts on boot, lower CPU priority than your other guests |
 | Network | internet only by default: LAN, Proxmox host and IPv6 blocked by the host firewall |
 | Runners | official `actions/runner`, auto-updating, one systemd service per runner |
 | Docker in jobs | `docker build/run`, `services:`, `container:` jobs, buildx, compose |
 | Networking | `--network host`, so `services:` ports work on `localhost` like on hosted runners |
 | Hosted-runner parity | user `runner` (uid 1001) with passwordless `sudo`, `/opt/hostedtoolcache`, `ImageOS=ubuntu24`, so `actions/setup-*` work |
-| Cleanup | workspace wiped before each job, file ownership fixed after container jobs, daily Docker prune |
+| Cleanup | workspace wiped before each job, file ownership fixed after container jobs, daily Docker prune, build cache capped at a quarter of the disk |
 
 ### Image flavors
 
@@ -118,8 +118,13 @@ any further jobs wait in GitHub's queue. You choose where the runners live:
 
 | Layout | What you get | Use when |
 |---|---|---|
-| `shared` (default) | 1 LXC, *N* runners, one Docker, disk and image | trusted repos; least overhead |
-| `separate` | *N* LXCs, 1 runner each, each with its own firewall and Docker | untrusted or mixed repos; jobs fully isolated from each other |
+| `shared` (default) | 1 LXC, *N* runners, one Docker, disk and image | light jobs from trusted repos; least overhead |
+| `separate` | *N* LXCs, 1 runner each, each with its own firewall and Docker | Docker builds, `services:` or `container:` jobs, heavy builds, untrusted or mixed repos |
+
+In `shared`, the per-runner cap only covers the runner itself. Containers a job
+starts (`docker build`, `services:`, `container:` jobs) share the whole LXC, so one
+of them can starve the other runners. In `separate`, the LXC limits cover
+everything a job starts, and `nproc` shows the runner's real core count.
 
 `separate` costs about 0.5 GB of RAM plus one image copy (~3, ~13 or ~15 GB of disk)
 per extra container. The image is built only once and copied to the others. All
@@ -161,9 +166,9 @@ its own VLAN (advanced settings).
 
 ## Sizing
 
-Choose a **per-runner size**. Each runner container is capped at that size, so
-one heavy job can't starve the others. The LXC totals are computed from the size
-and the runner count:
+Choose a **per-runner size**. Each runner container is capped at that size
+([Parallel jobs](#parallel-jobs) explains what the cap covers). The LXC totals
+are computed from the size and the runner count:
 
 | Preset | CPU / runner | RAM / runner | Job disk / runner | Good for |
 |---|---|---|---|---|
@@ -174,7 +179,7 @@ and the runner count:
 | `custom` | you choose | you choose | you choose | |
 
 LXC totals:
-- **CPU:** runners × CPU, capped at the host's cores.
+- **CPU:** runners × CPU, capped at the host's cores minus one, so the host always keeps a core.
 - **RAM:** runners × RAM, plus 1 GB for the OS.
 - **Disk:** 2 GB OS, plus the image (`standard` ~3 GB, `full` ~13 GB, `full-plus` ~15 GB), plus runners × (1 GB + job disk).
 
@@ -185,17 +190,33 @@ CPU and RAM are **limits, not reservations**: an idle runner uses about 150 MB.
 On LVM-thin and ZFS the disk is thin-provisioned, so only data actually written
 takes space. Unused job images are pruned daily.
 
+The runner LXCs get `cpuunits 50` (Proxmox default: 100). When the host is busy,
+your other VMs and containers get twice the CPU share of CI jobs. Set
+`CPU_UNITS` to change this. If the CPU limits of all runner LXCs add up to more
+than the host has, the installer asks before it continues.
+
+**Parallel workers.** In `shared`, `nproc` inside a runner shows every core of the
+LXC, not the runner's cap. Tools that start one worker per core then run far more
+workers than the cap allows, which throttles the job and can run it out of memory.
+Each runner therefore gets `GOMAXPROCS`, `CARGO_BUILD_JOBS`,
+`CMAKE_BUILD_PARALLEL_LEVEL` and `PYTEST_XDIST_AUTO_NUM_WORKERS` set to its CPU cap.
+Jest and Vitest have no such variable: pass `--maxWorkers=<CPU cap>` in your
+workflows.
+
+**Storage.** The installer stops if Docker in the LXC can only use the `vfs` or
+`native` storage driver. Those copy the whole runner image for every container.
+On ZFS this happens before Proxmox VE 8.1 (ZFS 2.2). Upgrade, or put the container
+on LVM-thin or directory storage.
+
 Change limits later:
 
 ```text
 gha-runners limits                          # show (inside the LXC)
 gha-runners limits --cpus 4 --memory 8192   # per-runner caps, restarts runners (0 = unlimited)
 pct set <CTID> --cores 8 --memory 16384     # LXC totals (on the Proxmox host)
+pct set <CTID> --cpuunits 50                # CPU priority, e.g. for runners installed before it was set
 pct resize <CTID> rootfs +10G               # grow the disk (on the Proxmox host)
 ```
-
-Containers that a job starts itself (`docker run`, `services:`) are bounded by the
-LXC totals, not by the per-runner cap.
 
 ## Persistent vs. ephemeral
 
@@ -238,7 +259,7 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/quavon-dev/quavon-docker
 Other variables: `LAYOUT=shared|separate`, `SIZE=custom` with `RUNNER_CPUS` / `RUNNER_MEM`, `CORES` / `RAM` / `DISK`
 (override the totals), `NET_ISOLATION=internet|lan`, `DNS_SERVERS`, `LAN_ALLOW=10.0.0.5,10.0.10.0/24`,
 `RUNNER_MODE=ephemeral` with `GH_PAT`, `RUNNER_PREFIX`, `RUNNER_GROUP`,
-`CT_HOSTNAME`, `SWAP`, `BRIDGE`, `NET_IP` / `NET_GW`, `VLAN`, `SSH_KEYS`, `UNPRIVILEGED`,
+`CT_HOSTNAME`, `SWAP`, `CPU_UNITS` (CPU priority, 1-10000, default 50), `BRIDGE`, `NET_IP` / `NET_GW`, `VLAN`, `SSH_KEYS`, `UNPRIVILEGED`,
 `REPO_URL` / `REPO_BRANCH` (forks).
 
 For a private fork, clone it on the Proxmox host and run `./install.sh`. The local
@@ -271,7 +292,7 @@ checkout is copied into the container and nothing is cloned.
 Everything runs in Docker on any machine. No Proxmox host is needed.
 
 ```bash
-tests/run.sh         # shellcheck + unit tests + 17 end-to-end wizard runs
+tests/run.sh         # shellcheck + unit tests + 21 end-to-end wizard runs
 tests/lxc/run.sh     # inside-the-LXC side for real: Docker, systemd units, image build, runner container
 ```
 

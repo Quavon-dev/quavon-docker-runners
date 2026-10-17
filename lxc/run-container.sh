@@ -32,10 +32,18 @@ fi
 # Per-runner caps so one heavy job can't starve its siblings. (Containers a
 # job starts itself via the socket are bounded by the LXC limits instead.)
 # Only applied when the LXC delegates the needed cgroup controllers to Docker.
-limits=()
+limits=() parallel_env=()
 read -r can_cpu can_mem <<<"$(docker info --format '{{.CPUCfsQuota}} {{.MemoryLimit}}' 2>/dev/null || echo false false)"
 if [[ -n "${RUNNER_CPUS:-}" ]]; then
-  if [[ "$can_cpu" == true ]]; then limits+=(--cpus "$RUNNER_CPUS"); else echo "warning: CPU limits unsupported here, skipping" >&2; fi
+  if [[ "$can_cpu" == true ]]; then
+    cpus="$(awk -v want="$RUNNER_CPUS" -v have="$(nproc)" 'BEGIN { print (want > have ? have : want) }')"
+    workers="${cpus%.*}"; (( workers >= 1 )) || workers=1
+    limits+=(--cpus "$cpus")
+    parallel_env=(-e "GOMAXPROCS=$workers" -e "CARGO_BUILD_JOBS=$workers" -e "CMAKE_BUILD_PARALLEL_LEVEL=$workers"
+                  -e "PYTEST_XDIST_AUTO_NUM_WORKERS=$workers")
+  else
+    echo "warning: CPU limits unsupported here, skipping" >&2
+  fi
 fi
 if [[ -n "${RUNNER_MEM:-}" ]]; then
   if [[ "$can_mem" == true ]]; then limits+=(--memory "${RUNNER_MEM}m" --memory-swap "${RUNNER_MEM}m"); else echo "warning: memory limits unsupported here, skipping" >&2; fi
@@ -69,6 +77,7 @@ exec docker run --rm --init --pull never \
   --group-add "$docker_gid" \
   --shm-size 2g \
   "${limits[@]}" \
+  "${parallel_env[@]}" \
   "${security[@]}" \
   --env-file "$env_file" \
   "${token_env[@]}" \

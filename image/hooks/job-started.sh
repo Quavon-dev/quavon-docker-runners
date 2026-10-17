@@ -9,7 +9,7 @@ work="${RUNNER_DIR:-}/_work"
 [[ -d "$work" ]] || exit 0
 
 # Container jobs write files as root; fix ownership so checkout never fails.
-sudo chown -R runner:runner "$work" 2>/dev/null || true
+sudo find "$work" \( ! -user runner -o ! -group runner \) -exec chown -h runner:runner {} + 2>/dev/null || true
 
 # Default workspace layout is _work/<repo>/<repo>; use it if the hook env lacks GITHUB_WORKSPACE.
 workspace="${GITHUB_WORKSPACE:-}"

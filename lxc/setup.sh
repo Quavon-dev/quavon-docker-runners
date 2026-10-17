@@ -33,24 +33,34 @@ setup_docker() {
   apt-get update -qq
   apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
-  install -d /etc/docker
-  [[ -f /etc/docker/daemon.json ]] || cat >/etc/docker/daemon.json <<'EOF'
-{
-  "log-driver": "json-file",
-  "log-opts": { "max-size": "20m", "max-file": "3" }
-}
-EOF
+  configure_daemon || true
   systemctl enable docker >/dev/null
   systemctl restart docker
 
   log "Verifying Docker can run containers"
   docker pull -q hello-world >/dev/null || die "cannot pull images - check DNS/proxy/internet in the LXC"
-  local out
+  local out driver
   if ! out="$(docker run --rm hello-world 2>&1)"; then
     echo "$out" >&2
     exit 3   # runtime failure: install.sh offers the AppArmor fallback
   fi
-  echo "Docker OK - storage driver: $(docker info --format '{{.Driver}}')"
+  driver="$(docker info --format '{{.Driver}}')"
+  case "$driver" in
+    vfs|native) die "Docker fell back to the '${driver}' storage driver, which copies the whole runner image
+for every container and overloads the disk. Use Proxmox VE 8.1+ (ZFS 2.2+), or put the
+container on LVM-thin or directory storage." ;;
+  esac
+  echo "Docker OK - storage driver: ${driver}"
+}
+
+configure_daemon() {
+  local file=/etc/docker/daemon.json cache_cap_gb
+  install -d /etc/docker
+  [[ -f "$file" ]] || echo '{ "log-driver": "json-file", "log-opts": { "max-size": "20m", "max-file": "3" } }' >"$file"
+  jq -e '.builder.gc' "$file" >/dev/null && return 1
+  cache_cap_gb="$(df -BG --output=size / | awk 'NR == 2 { v = int($1 / 4); print (v < 2 ? 2 : v) }')"
+  jq --arg cap "${cache_cap_gb}GB" '.builder.gc = { enabled: true, defaultMaxUsedSpace: $cap }' "$file" >"${file}.new" \
+    && mv "${file}.new" "$file"
 }
 
 setup_files() {
@@ -62,6 +72,7 @@ setup_files() {
   install -m 0644 "${REPO_DIR}"/lxc/systemd/* /etc/systemd/system/
   systemctl daemon-reload
   systemctl enable --now gha-runners-prune.timer >/dev/null
+  if configure_daemon; then systemctl restart docker; fi
 }
 
 ensure_runner_user() {
