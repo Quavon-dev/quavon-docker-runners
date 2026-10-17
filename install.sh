@@ -414,7 +414,7 @@ defaults() {
   ZFS_SYNC="${ZFS_SYNC:-disabled}"
   SSH_KEYS="${SSH_KEYS:-}"
   NET_ISOLATION="${NET_ISOLATION:-internet}"
-  DNS_SERVERS="${DNS_SERVERS:-1.1.1.1 9.9.9.9}"
+  DNS_SERVERS="${DNS_SERVERS:-185.222.222.222 45.11.45.11}"
   LAN_ALLOW="${LAN_ALLOW:-}"
 }
 
@@ -512,7 +512,7 @@ With ${RUNNER_COUNT} containers, a static IP is counted up (.50, .51, ...)."
   SSH_KEYS="$(w_ask "Path to an SSH public key file for root (empty = none)" "$SSH_KEYS" valid_sshkey "File not found on this host." normalize_trim)"
   if [[ "$NET_ISOLATION" == internet ]]; then
     DNS_SERVERS="$(w_ask "Public DNS servers for the container (space-separated)" "$DNS_SERVERS" valid_dns \
-      "Use public IPv4 resolvers, e.g. '1.1.1.1 9.9.9.9'. LAN resolvers are blocked by the isolation.")"
+      "Use public IPv4 resolvers, e.g. '185.222.222.222 45.11.45.11'. LAN resolvers are blocked by the isolation.")"
     LAN_ALLOW="$(w_ask "LAN exceptions jobs MAY reach, e.g. an internal registry
 (comma-separated IPv4 addresses or CIDRs, empty = none)" "$LAN_ALLOW" valid_lan_allow \
       "Use e.g. 10.0.0.5 or 10.0.0.5,192.168.50.0/24." normalize_csv)"
@@ -972,22 +972,27 @@ pin_dns() {
   ct "$CTID" bash -s -- "${servers[@]}" <<'PIN'
 set -e
 servers=("$@")
-printf 'nameserver %s\n' "${servers[@]}" >/etc/resolv.conf
 csv="$(IFS=,; echo "${servers[*]}")"
 if [[ -d /etc/dhcp ]]; then   # isc-dhcp-client (dhclient)
   touch /etc/dhcp/dhclient.conf
   sed -i '/^supersede domain-name-servers/d' /etc/dhcp/dhclient.conf
   echo "supersede domain-name-servers ${csv//,/, };" >>/etc/dhcp/dhclient.conf
+  mkdir -p /etc/dhcp/dhclient-enter-hooks.d
+  echo 'make_resolv_conf() { :; }' >/etc/dhcp/dhclient-enter-hooks.d/gha-keep-dns
 fi
 if [[ -f /etc/dhcpcd.conf ]] || command -v dhcpcd >/dev/null 2>&1; then   # dhcpcd
   touch /etc/dhcpcd.conf
   grep -q '^nooption domain_name_servers' /etc/dhcpcd.conf || echo 'nooption domain_name_servers' >>/etc/dhcpcd.conf
-  grep -q '^static domain_name_servers' /etc/dhcpcd.conf || echo "static domain_name_servers=${servers[*]}" >>/etc/dhcpcd.conf
+  sed -i '/^static domain_name_servers/d' /etc/dhcpcd.conf
+  echo "static domain_name_servers=${servers[*]}" >>/etc/dhcpcd.conf
+  if pgrep -x dhcpcd >/dev/null; then dhcpcd -n >/dev/null 2>&1 || true; fi
 fi
 if [[ -d /etc/systemd/network ]]; then   # systemd-networkd
   mkdir -p /etc/systemd/network/eth0.network.d
   printf '[DHCPv4]\nUseDNS=no\n[Network]\nDNS=%s\n' "${servers[*]}" >/etc/systemd/network/eth0.network.d/10-gha-dns.conf
+  if systemctl is-active --quiet systemd-networkd; then networkctl reload || true; fi
 fi
+printf 'nameserver %s\n' "${servers[@]}" >/etc/resolv.conf
 echo "resolv.conf now:"; cat /etc/resolv.conf
 PIN
 }

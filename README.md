@@ -148,7 +148,7 @@ effectively have root there.
 | `REJECT` to 10/8, 172.16/12, 192.168/16, 100.64/10, 169.254/16, multicast | LAN, CGNAT and link-local blocked |
 | `REJECT` to the Proxmox host's own IPs | host blocked even if it has public addresses |
 | `REJECT` all IPv6 | LAN devices with global IPv6 addresses can't be reached |
-| DNS via `1.1.1.1` / `9.9.9.9` | a LAN resolver isn't needed |
+| DNS via [DNS.SB](https://dns.sb/) (`185.222.222.222` / `45.11.45.11`), kept even when DHCP hands out a LAN resolver | a LAN resolver isn't needed |
 | `ACCEPT` to `LAN_ALLOW` entries | opt-in exceptions, e.g. an internal registry or GitHub Enterprise Server |
 
 The installer checks that this works: `github.com` must be reachable, and the

@@ -196,7 +196,7 @@ def case_happy_shared():
     check("✖" not in out, "unexpected failure mark")
     create = read(f"{STATE}/ct-100.create")
     for arg in ["--cores\n4", "--memory\n9216", "--cpuunits\n50", "local-lvm:19", "nesting=1,keyctl=1,fuse=1",
-                "--unprivileged\n1", "firewall=1", "--nameserver\n1.1.1.1 9.9.9.9", "github-runner"]:
+                "--unprivileged\n1", "firewall=1", "--nameserver\n185.222.222.222 45.11.45.11", "github-runner"]:
         check(arg in create, f"pct create missing {arg!r}")
     check("zfs " not in calls(), "ZFS tuning ran on LVM-thin storage")
     fw = read("/etc/pve/firewall/100.fw")
@@ -206,7 +206,7 @@ def case_happy_shared():
     check("RUNNER_COUNT=2" in boot and "RUNNER_CPUS=2" in boot and "RUNNER_MEM=4096" in boot, "bootstrap sizing wrong")
     check(read(f"{STATE}/ct-100-runners").split() == ["gha-runners-1", "gha-runners-2"], "runners not registered")
     check("git clone" in calls(), "curl-style run should git clone the repo")
-    check("bash -s -- 1.1.1.1 9.9.9.9" in calls(), "public DNS not pinned against DHCP overwrite")
+    check("bash -s -- 185.222.222.222 45.11.45.11" in calls(), "public DNS not pinned against DHCP overwrite")
     check(read(f"{STATE}/ct-exec-without-env") == "", "a container command ran without the fixed PATH/locale")
     env_used = read(f"{STATE}/last-ct-env")
     check("PATH=/usr/local/sbin:/usr/local/bin" in env_used and "LC_ALL=C.UTF-8" in env_used, f"container env wrong: {env_used}")
