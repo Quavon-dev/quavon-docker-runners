@@ -1,0 +1,16 @@
+[Unit]
+Description=Disk guard for GitHub Actions runners (reserve + cleanup when full)
+Wants=docker.service
+After=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gha-runners _diskguard
+Restart=always
+RestartSec=5
+# Must keep working when jobs exhaust the LXC
+OOMScoreAdjust=-500
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

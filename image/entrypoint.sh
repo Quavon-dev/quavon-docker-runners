@@ -17,6 +17,8 @@ source /etc/gha/env.sh
 
 cd "$RUNNER_DIR" || die "runner dir $RUNNER_DIR not mounted"
 [[ -x ./run.sh ]] || die "runner binaries missing in $RUNNER_DIR (run 'gha-runners add' on the LXC)"
+# A job that was running when the container stopped is gone (see job-started.sh).
+rm -f .gha-job-running
 
 if [[ "${RUNNER_EPHEMERAL:-0}" == 1 ]]; then
   [[ -n "${RUNNER_TOKEN:-}" ]] || die "ephemeral mode needs RUNNER_TOKEN"

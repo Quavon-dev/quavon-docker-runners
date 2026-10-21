@@ -55,6 +55,7 @@ chk "no half-registered runner dir left" '[[ ! -e /srv/gha-runners/itest-1/.runn
 chk "token never printed by registration" '! grep -q "AAAAAAAAAAAAAAAAAAAAAAAAAAAA" /tmp/register.log'
 chk "CLI + units installed" 'command -v gha-runners >/dev/null && [[ -f /etc/systemd/system/gha-runner@.service ]]'
 chk "prune timer enabled" 'systemctl is-enabled --quiet gha-runners-prune.timer'
+chk "disk guard enabled" 'systemctl is-enabled --quiet gha-runners-diskguard.service'
 chk "runner user uid 1001" '[[ $(id -u runner) == 1001 ]]'
 chk "config written" 'grep -q "RUNNER_IMAGE=quavon/gha-runner:standard" /etc/gha-runners/config.env'
 chk "runner tarball downloaded + cached" 'ls /var/cache/gha-runners/actions-runner-linux-*.tar.gz >/dev/null 2>&1'
@@ -114,6 +115,41 @@ chk "job-started hook hands root-owned files back" '[[ $(stat -c %u:%g "$dir/_wo
 chk "job-started hook removes containers left by earlier jobs" '! docker inspect itest-leftover >/dev/null 2>&1'
 chk "job-started hook keeps unrelated containers" 'docker inspect itest-unrelated >/dev/null 2>&1'
 docker rm -f itest-leftover itest-unrelated >/dev/null 2>&1
+
+section "disk cleanup (gha-cleanup in the image)"
+docker exec "gha-$name" bash -c "mkdir -p $dir/_work/old-repo/old-repo $dir/_work/t/t ~/.cache/pip ~/.npm && touch $dir/_work/old-repo/old-repo/f ~/.cache/pip/f ~/.npm/f /tmp/job-junk"
+docker exec -e GITHUB_WORKSPACE="$dir/_work/t/t" "gha-$name" /opt/gha/hooks/job-started.sh >/dev/null 2>&1
+chk "below the threshold nothing extra is removed" '[[ -e $dir/_work/old-repo/old-repo/f ]]'
+chk "job-started marks the runner busy" '[[ -e $dir/.gha-job-running ]]'
+docker exec "gha-$name" /usr/local/bin/gha-cleanup --idle >/tmp/cleanup.log 2>&1
+chk "idle cleanup skips a busy runner" 'grep -q "job is running" /tmp/cleanup.log && [[ -e $dir/_work/old-repo/old-repo/f ]]'
+docker exec "gha-$name" /opt/gha/hooks/job-completed.sh >/dev/null 2>&1
+chk "job-completed clears the busy mark" '[[ ! -e $dir/.gha-job-running ]]'
+docker exec -e CLEANUP_AT_PERCENT=0 -e GITHUB_WORKSPACE="$dir/_work/t/t" "gha-$name" /opt/gha/hooks/job-started.sh >/tmp/cleanup.log 2>&1
+chk "above the threshold: other repos' workspaces removed" '[[ ! -e $dir/_work/old-repo ]]'
+chk "above the threshold: the starting job's directory kept" '[[ -d $dir/_work/t/t ]]'
+chk "above the threshold: home caches and /tmp emptied" '! docker exec "gha-$name" bash -c "ls ~/.cache/pip ~/.npm /tmp/job-junk" >/dev/null 2>&1'
+chk "cleanup reports what it freed" 'grep -q "gha-cleanup: freed" /tmp/cleanup.log'
+docker exec "gha-$name" /opt/gha/hooks/job-completed.sh >/dev/null 2>&1
+
+section "disk guard (reserve + cleanup when full)"
+chk "disk guard running" 'systemctl is-active --quiet gha-runners-diskguard.service'
+for _ in $(seq 1 30); do [[ -s /var/lib/gha-runners/disk-reserve ]] && break; sleep 1; done
+chk "disk reserve set aside" '[[ $(stat -c %s /var/lib/gha-runners/disk-reserve 2>/dev/null || echo 0) -ge 536870912 ]]'
+systemctl stop gha-runners-diskguard.service
+docker exec "gha-$name" bash -c "mkdir -p $dir/_work/old-repo ~/.cache/x && touch ~/.cache/x/f"
+docker pull -q busybox >/dev/null 2>&1
+echo DISK_FULL_FREE_MB=999999999 >>/etc/gha-runners/config.env
+gha-runners _diskguard --once >/tmp/guard.log 2>&1; rc=$?
+sed -i '/^DISK_FULL_FREE_MB=/d' /etc/gha-runners/config.env
+chk "guard handles a full disk (rc=$rc)" '[[ $rc == 0 ]] && grep -q "disk full" /tmp/guard.log'
+chk "full disk: reserve released" '[[ ! -e /var/lib/gha-runners/disk-reserve ]]'
+chk "full disk: unused images removed" '! docker image inspect busybox >/dev/null 2>&1'
+chk "full disk: runner image kept" 'docker image inspect quavon/gha-runner:standard >/dev/null 2>&1'
+chk "full disk: idle runner cleaned by gha-cleanup" '[[ ! -e $dir/_work/old-repo ]] && grep -q "$name: gha-cleanup: freed" /tmp/guard.log'
+gha-runners _diskguard --once >/tmp/guard.log 2>&1
+chk "reserve set aside again once there is room" '[[ -s /var/lib/gha-runners/disk-reserve ]]'
+systemctl start gha-runners-diskguard.service
 
 section "CLI"
 gha-runners list >/tmp/list.log 2>&1

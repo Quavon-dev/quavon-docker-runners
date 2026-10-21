@@ -55,6 +55,7 @@ RUN /opt/gha/build/run-step.sh 99-finalize   "$FLAVOR"
 
 COPY --chmod=0755 entrypoint.sh /opt/gha/entrypoint.sh
 COPY --chmod=0755 hooks/ /opt/gha/hooks/
+COPY --chmod=0755 tools/gha-cleanup /usr/local/bin/gha-cleanup
 
 USER runner
 WORKDIR /home/runner

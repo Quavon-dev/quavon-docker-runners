@@ -15,6 +15,14 @@ RUNNER_UID=1001
 NAME_RE='^[A-Za-z0-9._-]{1,64}$'
 IMAGE_LABEL=com.quavon.gha-runner
 PRUNE_AT_PERCENT=80
+# Disk guard: a reserve file keeps part of the disk away from jobs, so a full
+# disk can always be cleaned up. DISK_RESERVE_PERCENT in config.env (0 = off).
+RESERVE_FILE=/var/lib/gha-runners/disk-reserve
+DISK_RESERVE_PERCENT=10
+RESERVE_MIN_MB=512
+RESERVE_MAX_MB=10240
+DISK_FULL_FREE_MB=1024
+GUARD_INTERVAL=15
 
 c_ok=$'\e[32m' c_err=$'\e[31m' c_dim=$'\e[2m' c_off=$'\e[0m'
 info() { printf '%s\n' "$*"; }
@@ -365,6 +373,80 @@ cmd_limits() {
 }
 
 disk_used_percent() { df --output=pcent / | tail -1 | tr -dc 0-9; }
+disk_free_mb() { df -BM --output=avail / | tail -1 | tr -dc 0-9; }
+disk_size_mb() { df -BM --output=size / | tail -1 | tr -dc 0-9; }
+reserve_mb() { [[ -f "$RESERVE_FILE" ]] && echo $(( $(stat -c %s "$RESERVE_FILE") / 1048576 )) || echo 0; }
+
+reserve_target_mb() {
+  local pct="${DISK_RESERVE_PERCENT:-10}" mb
+  if ! [[ "$pct" =~ ^[0-9]+$ ]] || (( pct == 0 || pct >= 50 )); then echo 0; return; fi
+  mb=$(( $(disk_size_mb) * pct / 100 ))
+  (( mb < RESERVE_MIN_MB )) && mb=$RESERVE_MIN_MB
+  (( mb > RESERVE_MAX_MB )) && mb=$RESERVE_MAX_MB
+  echo "$mb"
+}
+
+# Creates the reserve when it's missing and the disk has room for it. ZFS
+# (before 2.2 and with compression) doesn't really allocate fallocate'd or
+# zeroed blocks, so there the reserve is written with random data.
+ensure_reserve() {
+  local target have
+  target="$(reserve_target_mb)" have="$(reserve_mb)"
+  if (( target == 0 )); then rm -f "$RESERVE_FILE"; return 0; fi
+  (( have >= target * 95 / 100 )) && return 0
+  (( $(disk_free_mb) + have - target >= 2 * DISK_FULL_FREE_MB )) || return 0
+  install -d -m 0700 "${RESERVE_FILE%/*}"
+  rm -f "$RESERVE_FILE"
+  if fallocate -l "${target}M" "$RESERVE_FILE" 2>/dev/null && sync -f "$RESERVE_FILE" \
+    && (( $(du -m "$RESERVE_FILE" | cut -f1) >= target * 9 / 10 )); then
+    :
+  elif ! head -c "$(( target * 1048576 ))" /dev/urandom >"$RESERVE_FILE" 2>/dev/null; then
+    rm -f "$RESERVE_FILE"; warn "could not create the ${target} MB disk reserve"; return 1
+  fi
+  chmod 600 "$RESERVE_FILE"
+  info "disk reserve: ${target} MB set aside for cleanup"
+}
+
+# Runs gha-cleanup (built into the runner image) in every runner that is
+# between jobs. Busy runners clean up at their next job start.
+cleanup_idle_runners() {
+  local name
+  for name in $(runner_names); do
+    docker inspect -f '{{.State.Running}}' "gha-${name}" 2>/dev/null | grep -qx true || continue
+    timeout 900 docker exec "gha-${name}" /usr/local/bin/gha-cleanup --idle 2>&1 | sed "s/^/${name}: /" || true
+  done
+}
+
+# Watches the disk. When it's full, releases the reserve so Docker and the
+# cleanup have room to work, removes unused Docker data and cleans every idle
+# runner, then sets the reserve aside again once there's space.
+cmd_diskguard() {
+  require_root
+  # shellcheck source=/dev/null
+  [[ -f "${CONF_DIR}/config.env" ]] && source "${CONF_DIR}/config.env"
+  local free
+  while :; do
+    free="$(disk_free_mb)"
+    if (( free < DISK_FULL_FREE_MB )); then
+      warn "disk full (${free} MB free): releasing the ${RESERVE_FILE##*/} and cleaning up"
+      rm -f "$RESERVE_FILE"
+      prune_unused || true
+      cleanup_idle_runners
+      info "disk now $(disk_used_percent)% used, $(disk_free_mb) MB free"
+      [[ "${1:-}" == --once ]] || sleep 60   # give jobs time to finish before cleaning again
+    fi
+    ensure_reserve || true
+    [[ "${1:-}" == --once ]] && return 0
+    sleep "$GUARD_INTERVAL"
+  done
+}
+
+prune_unused() {
+  docker container prune --force
+  docker image prune --all --force --filter "label!=${IMAGE_LABEL}"
+  docker volume prune --force
+  docker builder prune --all --force
+}
 
 cmd_prune() {
   require_root; load_config
@@ -384,8 +466,7 @@ cmd_prune() {
   used="$(disk_used_percent)"
   if [[ "$all" == 1 ]] || (( used >= PRUNE_AT_PERCENT )); then
     info "disk ${used}% used: removing all unused images and build cache"
-    docker image prune --all --force --filter "label!=${IMAGE_LABEL}"
-    docker builder prune --all --force
+    prune_unused
   fi
 }
 
@@ -427,7 +508,10 @@ cmd_doctor() {
   if [[ "$driver" == vfs || "$driver" == native ]]; then
     warn "this driver copies the whole image for every container: move the LXC to ZFS 2.2+, LVM-thin or directory storage"
   fi
-  printf 'disk           : %s%% used\n' "$used"
+  printf 'disk           : %s%% used, %s MB free\n' "$used" "$(disk_free_mb)"
+  printf 'disk reserve   : %s MB of %s MB (%s)\n' "$(reserve_mb)" "$(reserve_target_mb)" "$RESERVE_FILE"
+  (( $(reserve_target_mb) == 0 || $(reserve_mb) > 0 )) || warn "disk reserve released: the disk was full recently"
+  systemctl is-active --quiet gha-runners-diskguard.service || warn "disk guard not running: systemctl enable --now gha-runners-diskguard"
   (( used < PRUNE_AT_PERCENT )) || warn "disk nearly full: gha-runners prune --all"
   printf 'LXC stalled    : cpu %s, memory %s, io %s of the last minute\n' "$(pressure cpu)" "$(pressure memory)" "$(pressure io)"
   doctor_runners
@@ -490,6 +574,7 @@ main() {
     limits) cmd_limits "$@" ;;
     doctor) cmd_doctor ;;
     prune) cmd_prune "$@" ;;
+    _diskguard) cmd_diskguard "$@" ;;
     _regtoken) cmd_regtoken "$@" ;;
     help|-h|--help) usage ;;
     *) usage; exit 1 ;;

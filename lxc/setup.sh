@@ -72,6 +72,8 @@ setup_files() {
   install -m 0644 "${REPO_DIR}"/lxc/systemd/* /etc/systemd/system/
   systemctl daemon-reload
   systemctl enable --now gha-runners-prune.timer >/dev/null
+  systemctl enable gha-runners-diskguard.service >/dev/null
+  systemctl restart gha-runners-diskguard.service   # picks up an updated gha-runners
   if configure_daemon; then systemctl restart docker; fi
 }
 

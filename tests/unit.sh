@@ -41,16 +41,16 @@ ok "private ip"                'is_private_ip 10.1.2.3 && is_private_ip 172.20.0
 RUNNER_FLAVOR=standard RUNNER_COUNT=2 LAYOUT=shared RUNNER_CPUS=2 RUNNER_MEM=4096
 host_cpus() { echo 8; }
 unset CORES RAM SWAP DISK; size_defaults 6
-t "size shared 2x medium"      "$CORES $RAM $DISK" "4 9216 19"
+t "size shared 2x medium"      "$CORES $RAM $DISK" "4 9216 22"
 RUNNER_COUNT=3 LAYOUT=separate; unset CORES RAM SWAP DISK; size_defaults 6
-t "size separate per CT"       "$CORES $RAM $DISK" "2 5120 12"
+t "size separate per CT"       "$CORES $RAM $DISK" "2 5120 14"
 RUNNER_COUNT=8 LAYOUT=shared RUNNER_CPUS=4; unset CORES RAM SWAP DISK; size_defaults 10
 t "cpu leaves a host core"     "$CORES" "7"
 host_cpus() { echo 1; }; unset CORES RAM SWAP DISK; size_defaults 10
 t "cpu on a 1-core host"       "$CORES" "1"
 host_cpus() { echo 8; }
 RUNNER_FLAVOR=full-plus RUNNER_COUNT=2 RUNNER_CPUS=2; unset CORES RAM SWAP DISK; size_defaults 6
-t "size full-plus image"       "$DISK" "31"
+t "size full-plus image"       "$DISK" "35"
 RUNNER_FLAVOR=standard
 
 # firewall rules
@@ -73,6 +73,17 @@ t "cli api repo"  "$(token_api https://github.com/o/r registration)" "https://ap
 t "cli api org"   "$(token_api https://github.com/o remove)" "https://api.github.com/orgs/o/actions/runners/remove-token"
 t "cli api ent"   "$(token_api https://github.com/enterprises/e registration)" "https://api.github.com/enterprises/e/actions/runners/registration-token"
 t "cli api ghes"  "$(token_api https://ghe.corp/t/r registration)" "https://ghe.corp/api/v3/repos/t/r/actions/runners/registration-token"
+
+# disk reserve: 10% of the disk, at least 512 MB, at most 10 GB, 0 = off
+disk_size_mb() { echo 20000; }
+t "reserve 10%"        "$(reserve_target_mb)" "2000"
+disk_size_mb() { echo 2000; }
+t "reserve minimum"    "$(reserve_target_mb)" "512"
+disk_size_mb() { echo 500000; }
+t "reserve maximum"    "$(reserve_target_mb)" "10240"
+t "reserve off"        "$(DISK_RESERVE_PERCENT=0 reserve_target_mb)" "0"
+t "reserve bad value"  "$(DISK_RESERVE_PERCENT=abc reserve_target_mb)" "0"
+unset -f disk_size_mb
 
 echo "unit: ${pass} passed$([[ $fail == 1 ]] && echo ', FAILURES above')"
 exit "$fail"

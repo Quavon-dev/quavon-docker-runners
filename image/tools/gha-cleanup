@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# gha-cleanup - free disk space on a runner. Built into the runner image.
+#
+#   gha-cleanup [--keep DIR]  clean up if the disk is CLEANUP_AT_PERCENT (80) full (job-started hook)
+#   gha-cleanup --force       clean up now
+#   gha-cleanup --idle        clean up now unless a job is running, including every
+#                             old workspace (the LXC's disk guard runs this when the disk is full)
+#
+# Removes containers earlier jobs left behind, unused Docker images, volumes and
+# build cache, workspaces of other repositories, downloaded actions, /tmp and the
+# package caches in $HOME (npm, pip, Go, Cargo, Gradle, Maven, NuGet ...).
+# Never the runner image and never DIR, the workspace of the job that is starting.
+set -uo pipefail
+
+CLEANUP_AT_PERCENT="${CLEANUP_AT_PERCENT:-80}"
+IMAGE_LABEL=com.quavon.gha-runner
+
+# Toolchain env (CARGO_HOME ...) when called via `docker exec`, outside a job.
+# shellcheck source=/dev/null
+[[ -f /etc/gha/env.sh ]] && source /etc/gha/env.sh
+
+mode=auto keep=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --force) mode=force; shift ;;
+    --idle) mode=idle; shift ;;
+    --keep) keep="${2:-}"; shift 2 ;;
+    *) echo "usage: gha-cleanup [--force | --idle] [--keep DIR]" >&2; exit 2 ;;
+  esac
+done
+
+: "${RUNNER_DIR:?RUNNER_DIR is not set}"
+work="${RUNNER_DIR}/_work"
+job_marker="${RUNNER_DIR}/.gha-job-running"
+
+used_percent() { df --output=pcent "$RUNNER_DIR" | tail -1 | tr -dc 0-9; }
+free_mb() { df -BM --output=avail "$RUNNER_DIR" | tail -1 | tr -dc 0-9; }
+
+# Containers whose mounts point into this runner's workspace belong to earlier
+# jobs of this runner (`docker run -d`, `compose up -d`). Siblings' are kept.
+remove_leftover_containers() {
+  local leftovers
+  leftovers="$(docker ps -aq \
+    | xargs -r docker inspect -f '{{.Id}} {{index .Config.Labels "com.docker.compose.project.working_dir"}} {{range .Mounts}}{{.Source}} {{end}}' 2>/dev/null \
+    | awk -v w="${work}/" 'index($0, " " w) { print $1 }')"
+  [[ -n "$leftovers" ]] || return 0
+  echo "Removing $(wc -l <<<"$leftovers") container(s) left running by earlier jobs"
+  xargs docker rm -f -v <<<"$leftovers" >/dev/null 2>&1 || true
+}
+
+prune_docker() {
+  docker container prune --force >/dev/null 2>&1
+  docker image prune --all --force --filter "label!=${IMAGE_LABEL}" >/dev/null 2>&1
+  docker volume prune --all --force >/dev/null 2>&1 || docker volume prune --force >/dev/null 2>&1
+  docker builder prune --all --force >/dev/null 2>&1
+  docker network prune --force >/dev/null 2>&1
+  return 0
+}
+
+# Workspaces of other repositories; the runner recreates them when a job needs
+# them. Downloaded actions only when idle: a starting job has already fetched
+# its own. _temp and _tool stay.
+clean_workspaces() {
+  local dir base
+  [[ -d "$work" ]] || return 0
+  for dir in "$work"/*; do
+    base="${dir##*/}"
+    [[ -d "$dir" && "$dir" != "$keep" ]] || continue
+    [[ "$base" == _* && ! ( "$base" == _actions && "$mode" == idle ) ]] && continue
+    sudo rm -rf --one-file-system "$dir"
+  done
+  return 0
+}
+
+clean_caches() {
+  local cargo="${CARGO_HOME:-$HOME/.cargo}"
+  sudo rm -rf --one-file-system "$HOME/.cache" "$HOME/.npm" "$HOME/.yarn" "$HOME/.pnpm-store" \
+    "$HOME/.local/share/pnpm/store" "$HOME/.bun/install/cache" "$HOME/go/pkg/mod" \
+    "$cargo/registry" "$cargo/git" "$HOME/.gradle/caches" "$HOME/.m2/repository" "$HOME/.nuget/packages"
+  sudo find /tmp -mindepth 1 -maxdepth 1 -exec rm -rf --one-file-system {} + 2>/dev/null
+  return 0
+}
+
+if [[ "$mode" == idle ]]; then
+  # The job-started hook holds this lock while it marks the runner busy.
+  exec 9>"${RUNNER_DIR}/.gha-cleanup.lock"
+  flock -n 9 || { echo "gha-cleanup: a job is starting, skipped"; exit 0; }
+  [[ -e "$job_marker" ]] && { echo "gha-cleanup: a job is running, skipped"; exit 0; }
+fi
+
+remove_leftover_containers
+used="$(used_percent)"
+[[ "$mode" == auto ]] && (( used < CLEANUP_AT_PERCENT )) && exit 0
+
+before="$(free_mb)"
+echo "gha-cleanup: disk ${used}% used, freeing space"
+prune_docker
+clean_workspaces
+clean_caches
+echo "gha-cleanup: freed $(( $(free_mb) - before )) MB, disk now $(used_percent)% used"
+exit 0

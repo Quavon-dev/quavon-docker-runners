@@ -488,7 +488,9 @@ size_defaults() {   # size_defaults <job disk GB per runner>
   CORES="${CORES:-$cpus}"
   RAM="${RAM:-$((per * RUNNER_MEM + 1024))}"
   SWAP="${SWAP:-1024}"
-  DISK="${DISK:-$((2 + image_gb + per * (1 + $1)))}"
+  # +1/9 so the 10% disk reserve (see gha-runners diskguard) leaves the job disk intact
+  local disk=$((2 + image_gb + per * (1 + $1)))
+  DISK="${DISK:-$(( (disk * 10 + 8) / 9 ))}"
 }
 
 ask_advanced() {

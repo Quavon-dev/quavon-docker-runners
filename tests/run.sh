@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 echo "== shellcheck"
-shellcheck install.sh lxc/*.sh lxc/gha-runners image/*.sh image/hooks/*.sh image/scripts/*.sh tests/*.sh tests/fake-pve/bin/{pct,pvesh,pvesm,pveam,ip,zfs}
+shellcheck install.sh lxc/*.sh lxc/gha-runners image/*.sh image/hooks/*.sh image/tools/gha-cleanup image/scripts/*.sh tests/*.sh tests/fake-pve/bin/{pct,pvesh,pvesm,pveam,ip,zfs}
 echo "ok"
 
 docker run --rm -v "$PWD":/src:ro debian:13 bash -c '

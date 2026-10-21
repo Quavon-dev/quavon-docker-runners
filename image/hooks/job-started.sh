@@ -6,26 +6,32 @@ set -uo pipefail
 [[ -n "${RUNNER_DIR:-}" ]] || exit 0
 work="${RUNNER_DIR}/_work"
 
-leftovers="$(docker ps -aq \
-  | xargs -r docker inspect -f '{{.Id}} {{index .Config.Labels "com.docker.compose.project.working_dir"}} {{range .Mounts}}{{.Source}} {{end}}' 2>/dev/null \
-  | awk -v w="${work}/" 'index($0, " " w) { print $1 }')"
-if [[ -n "$leftovers" ]]; then
-  echo "Removing $(wc -l <<<"$leftovers") container(s) left running by earlier jobs"
-  xargs docker rm -f -v <<<"$leftovers" >/dev/null 2>&1 || true
-fi
-
-[[ "${RUNNER_EPHEMERAL:-0}" == 1 ]] && exit 0
-[[ -d "$work" ]] || exit 0
-
-# Container jobs write files as root; fix ownership so checkout never fails.
-sudo find "$work" \( ! -user runner -o ! -group runner \) -exec chown -h runner:runner {} + 2>/dev/null || true
-
 # Default workspace layout is _work/<repo>/<repo>; use it if the hook env lacks GITHUB_WORKSPACE.
 workspace="${GITHUB_WORKSPACE:-}"
 if [[ -z "$workspace" && -n "${GITHUB_REPOSITORY:-}" ]]; then
   repo="${GITHUB_REPOSITORY#*/}"
   workspace="${work}/${repo}/${repo}"
 fi
+workspace="${workspace%/}"
+
+# Mark the runner busy so the LXC's disk guard leaves it alone until
+# job-completed. The lock waits for a guard cleanup that is already running.
+exec 9>"${RUNNER_DIR}/.gha-cleanup.lock"
+flock -w 600 9 || true
+touch "${RUNNER_DIR}/.gha-job-running"
+
+# Leftover containers of earlier jobs; above 80% disk also images, caches and
+# other repositories' workspaces. Keeps this job's directory.
+keep=""
+[[ "$workspace" == "$work"/*/* ]] && keep="${workspace%/*}"
+/usr/local/bin/gha-cleanup --keep "$keep"
+exec 9>&-
+
+[[ "${RUNNER_EPHEMERAL:-0}" == 1 ]] && exit 0
+[[ -d "$work" ]] || exit 0
+
+# Container jobs write files as root; fix ownership so checkout never fails.
+sudo find "$work" \( ! -user runner -o ! -group runner \) -exec chown -h runner:runner {} + 2>/dev/null || true
 
 if [[ -n "$workspace" && -d "$workspace" && "$workspace" == "$work"/* ]]; then
   echo "Cleaning workspace ${workspace}"

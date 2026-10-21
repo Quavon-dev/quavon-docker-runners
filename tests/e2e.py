@@ -195,7 +195,7 @@ def case_happy_shared():
         check(f"✔ {line}" in out, f"missing check mark: {line}")
     check("✖" not in out, "unexpected failure mark")
     create = read(f"{STATE}/ct-100.create")
-    for arg in ["--cores\n4", "--memory\n9216", "--cpuunits\n50", "local-lvm:19", "nesting=1,keyctl=1,fuse=1",
+    for arg in ["--cores\n4", "--memory\n9216", "--cpuunits\n50", "local-lvm:22", "nesting=1,keyctl=1,fuse=1",
                 "--unprivileged\n1", "firewall=1", "--nameserver\n185.222.222.222 45.11.45.11", "github-runner"]:
         check(arg in create, f"pct create missing {arg!r}")
     check("zfs " not in calls(), "ZFS tuning ran on LVM-thin storage")

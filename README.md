@@ -47,6 +47,7 @@ jobs:
 | Networking | `--network host`, so `services:` ports work on `localhost` like on hosted runners |
 | Hosted-runner parity | user `runner` (uid 1001) with passwordless `sudo`, `/opt/hostedtoolcache`, `ImageOS=ubuntu24`, so `actions/setup-*` work |
 | Cleanup | containers a job left running (`docker run -d`, `compose up -d`) removed before the next job, workspace wiped, file ownership fixed after container jobs, hourly Docker prune, build cache capped at a quarter of the disk |
+| Full disk | 10% of the disk is held back from jobs, so a full disk can always be cleaned up (see [Full disk](#full-disk)) |
 
 ### Image flavors
 
@@ -181,14 +182,16 @@ are computed from the size and the runner count:
 LXC totals:
 - **CPU:** runners × CPU, capped at the host's cores minus one, so the host always keeps a core.
 - **RAM:** runners × RAM, plus 1 GB for the OS.
-- **Disk:** 2 GB OS, plus the image (`standard` ~3 GB, `full` ~13 GB, `full-plus` ~15 GB), plus runners × (1 GB + job disk).
+- **Disk:** 2 GB OS, plus the image (`standard` ~3 GB, `full` ~13 GB, `full-plus` ~15 GB), plus runners × (1 GB + job disk),
+  plus the [disk reserve](#full-disk) (a ninth on top, so jobs still get their full job disk).
 
-For example, 2 × `medium` with `standard` gives 4 cores, 9 GB RAM and 19 GB disk.
+For example, 2 × `medium` with `standard` gives 4 cores, 9 GB RAM and 22 GB disk.
 In advanced mode you can override every total.
 
 CPU and RAM are **limits, not reservations**: an idle runner uses about 150 MB.
 On LVM-thin and ZFS the disk is thin-provisioned, so only data actually written
-takes space. Unused job images are pruned once the disk is 80% full (checked hourly).
+takes space. Unused job images are pruned once the disk is 80% full (checked hourly
+and before every job), and a reserve keeps a full disk from taking the runners down ([Full disk](#full-disk)).
 
 The runner LXCs get `cpuunits 50` (Proxmox default: 100). When the host is busy,
 your other VMs and containers get twice the CPU share of CI jobs. Set
@@ -225,6 +228,31 @@ pct set <CTID> --cores 8 --memory 16384     # LXC totals (on the Proxmox host)
 pct set <CTID> --cpuunits 50                # CPU priority, e.g. for runners installed before it was set
 pct resize <CTID> rootfs +10G               # grow the disk (on the Proxmox host)
 ```
+
+### Full disk
+
+Jobs can only fill about 90% of the disk. The rest is a reserve file
+(`/var/lib/gha-runners/disk-reserve`, 10% of the disk, 512 MB to 10 GB), so Docker,
+the runners and the cleanup still have room to work when a job fills everything else.
+
+- **Before every job**, `gha-cleanup` (built into the runner image) checks the disk.
+  From 80% it removes unused Docker images, volumes and build cache, workspaces of
+  other repositories, `/tmp` and the package caches in the runner's home (npm, pip,
+  Go, Cargo, Gradle, Maven, NuGet, bun, pnpm). The runner image and the starting
+  job's workspace are kept.
+- **When the disk is full** (less than 1 GB free), the disk guard
+  (`gha-runners-diskguard.service`, checks every 15 seconds) deletes the reserve,
+  removes unused Docker data and runs `gha-cleanup` in every runner that's between
+  jobs. Busy runners are left alone and clean up at their next job. Once there's
+  room again, the reserve is set aside again.
+
+The job that filled the disk still fails, but the runners keep running and the next
+jobs get a clean disk. `gha-runners doctor` shows whether the reserve was released.
+Set `DISK_RESERVE_PERCENT` in `/etc/gha-runners/config.env` to change the reserve
+(`0` turns it off). Jobs can also call `gha-cleanup --force` themselves.
+
+On ZFS, blocks that are only reserved or zero aren't really allocated, so there the
+reserve is written with random data and takes real space in the pool.
 
 ## Persistent vs. ephemeral
 
@@ -326,11 +354,12 @@ install.sh                 Proxmox host wizard (pct create / push / exec)
 lxc/setup.sh               provisioning inside the LXC (Docker, CLI, registration)
 lxc/gha-runners            management CLI
 lxc/run-container.sh       docker run wrapper used by gha-runner@.service
-lxc/systemd/               runner template unit + hourly prune timer
+lxc/systemd/               runner template unit, hourly prune timer, disk guard
 lxc/seccomp/io-uring.json  seccomp profile for full-plus runners (Docker default + io_uring)
 image/Dockerfile           runner image (FLAVOR=standard|full|full-plus)
 image/scripts/NN-*.sh      one build step per toolchain ("# flavors:" header)
 image/entrypoint.sh        ephemeral re-registration, env capture, run.sh
 image/hooks/               job-started / job-completed cleanup hooks
+image/tools/gha-cleanup    disk cleanup inside the runner (hooks, disk guard, jobs)
 tests/                     unit + end-to-end tests (fake Proxmox) and LXC integration test
 ```
