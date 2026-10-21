@@ -60,6 +60,9 @@ if [[ "${RUNNER_FLAVOR:-}" == full-plus && "${RUNNER_IO_URING:-1}" != 0 ]]; then
 fi
 
 docker rm -f "gha-${name}" >/dev/null 2>&1 || true
+# A container Docker lost track of (e.g. on a full disk) can leave its
+# endpoint in the host network behind and block every new start.
+docker network disconnect -f host "gha-${name}" >/dev/null 2>&1 || true
 
 # --network host  : service containers / published ports reachable on localhost (like hosted)
 # same-path mount : job containers get valid host paths for _work and externals
@@ -69,8 +72,28 @@ docker image inspect "$RUNNER_IMAGE" >/dev/null 2>&1 || {
   sleep 30; exit 1
 }
 
+# Docker sometimes keeps a removed container's name reserved, and only a
+# daemon restart frees it. Restart it after a few failed starts, but not
+# while another runner is in the middle of a job.
+stale_name_recovery() {
+  local count_file="/run/gha-runners/${name}.start-conflicts" count busy
+  install -d /run/gha-runners
+  count=$(( $(cat "$count_file" 2>/dev/null || echo 0) + 1 ))
+  echo "$count" >"$count_file"
+  (( count >= 5 )) || return 0
+  busy="$(find /srv/gha-runners -mindepth 2 -maxdepth 2 -name .gha-job-running 2>/dev/null | head -1)"
+  if [[ -n "$busy" ]]; then
+    echo "Docker still holds the name gha-${name}; waiting for running jobs before restarting Docker" >&2
+    return 0
+  fi
+  echo "Docker still holds the name gha-${name} after ${count} tries: restarting Docker" >&2
+  rm -f "$count_file"
+  systemctl --no-block restart docker.service
+}
+
 # --pull never: the image is always built locally, never fetched from a registry
-exec docker run --rm --init --pull never \
+create_err="$(mktemp)"
+if ! id="$(docker create --rm --init --pull never \
   --name "gha-${name}" \
   --network host \
   --user 1001:1001 \
@@ -83,4 +106,13 @@ exec docker run --rm --init --pull never \
   "${token_env[@]}" \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v "${runner_dir}:${runner_dir}" \
-  "$RUNNER_IMAGE"
+  "$RUNNER_IMAGE" 2>"$create_err")"; then
+  cat "$create_err" >&2
+  grep -qE 'is already in use|already exists' "$create_err" && stale_name_recovery
+  rm -f "$create_err"
+  sleep 5; exit 1
+fi
+cat "$create_err" >&2; rm -f "$create_err"
+rm -f "/run/gha-runners/${name}.start-conflicts"
+unset RUNNER_TOKEN
+exec docker start --attach "$id"

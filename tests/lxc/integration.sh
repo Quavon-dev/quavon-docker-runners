@@ -85,6 +85,7 @@ fi
 systemctl start "gha-runner@$name"
 for _ in $(seq 1 30); do docker inspect "gha-$name" >/dev/null 2>&1 && break; sleep 1; done
 insp="$(docker inspect "gha-$name" 2>/dev/null || true)"
+chk "runner unit active (not restarting)" 'systemctl is-active --quiet "gha-runner@$name"'
 chk "runner container started" 'docker ps --format "{{.Names}}" | grep -qx "gha-$name"'
 chk "runs as uid 1001" 'grep -q "\"User\": \"1001:1001\"" <<<"$insp"'
 chk "host network" 'grep -q "\"NetworkMode\": \"host\"" <<<"$insp"'
@@ -139,12 +140,15 @@ chk "disk reserve set aside" '[[ $(stat -c %s /var/lib/gha-runners/disk-reserve 
 systemctl stop gha-runners-diskguard.service
 docker exec "gha-$name" bash -c "mkdir -p $dir/_work/old-repo ~/.cache/x && touch ~/.cache/x/f"
 docker pull -q busybox >/dev/null 2>&1
+docker volume create buildx_buildkit_itest0_state >/dev/null
+docker run -d --name buildx_buildkit_itest0 -v buildx_buildkit_itest0_state:/var/lib/buildkit busybox sleep 600 >/dev/null
 echo DISK_FULL_FREE_MB=999999999 >>/etc/gha-runners/config.env
 gha-runners _diskguard --once >/tmp/guard.log 2>&1; rc=$?
 sed -i '/^DISK_FULL_FREE_MB=/d' /etc/gha-runners/config.env
 chk "guard handles a full disk (rc=$rc)" '[[ $rc == 0 ]] && grep -q "disk full" /tmp/guard.log'
 chk "full disk: reserve released" '[[ ! -e /var/lib/gha-runners/disk-reserve ]]'
 chk "full disk: unused images removed" '! docker image inspect busybox >/dev/null 2>&1'
+chk "full disk: leftover buildx builder and its cache removed" '! docker inspect buildx_buildkit_itest0 >/dev/null 2>&1 && ! docker volume inspect buildx_buildkit_itest0_state >/dev/null 2>&1'
 chk "full disk: runner image kept" 'docker image inspect quavon/gha-runner:standard >/dev/null 2>&1'
 chk "full disk: idle runner cleaned by gha-cleanup" '[[ ! -e $dir/_work/old-repo ]] && grep -q "$name: gha-cleanup: freed" /tmp/guard.log'
 gha-runners _diskguard --once >/tmp/guard.log 2>&1

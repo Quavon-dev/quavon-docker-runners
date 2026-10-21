@@ -4,8 +4,12 @@
 source "$(dirname "$0")/lib.sh"
 
 log "git + git-lfs"
-add-apt-repository -y ppa:git-core/ppa
-apt_install git git-lfs
+# Launchpad is down now and then; Ubuntu's git is older but works.
+if ! { add-apt-repository -y ppa:git-core/ppa && apt_install git git-lfs; }; then
+  log "git-core PPA unavailable, using Ubuntu's git"
+  add-apt-repository -y --remove ppa:git-core/ppa || rm -f /etc/apt/sources.list.d/git-core-*
+  apt_install git git-lfs
+fi
 git lfs install --system
 git config --system --add safe.directory '*'
 

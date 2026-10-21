@@ -29,7 +29,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # Bootstrap only what the step runner needs; 00-base installs the rest.
-RUN apt-get update -qq \
+# Retry downloads: mirrors and PPAs answer 503 now and then.
+RUN printf 'Acquire::Retries "5";\nAcquire::http::Timeout "60";\nAcquire::https::Timeout "60";\n' \
+      >/etc/apt/apt.conf.d/80-retries \
+ && apt-get update -qq \
  && apt-get install -y --no-install-recommends ca-certificates curl gnupg sudo \
  && rm -rf /var/lib/apt/lists/*
 
