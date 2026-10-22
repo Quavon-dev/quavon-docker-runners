@@ -235,13 +235,15 @@ Jobs can only fill about 90% of the disk. The rest is a reserve file
 (`/var/lib/gha-runners/disk-reserve`, 10% of the disk, 512 MB to 10 GB), so Docker,
 the runners and the cleanup still have room to work when a job fills everything else.
 
-- **Before every job**, `gha-cleanup` (built into the runner image) checks the disk.
-  From 80% it removes unused Docker images, volumes and build cache, workspaces of
-  other repositories, `/tmp` and the package caches in the runner's home (npm, pip,
-  Go, Cargo, Gradle, Maven, NuGet, bun, pnpm). The runner image and the starting
+- **Before every job**, `gha-cleanup` (built into the runner image) removes the
+  workspaces of other repositories (they're wiped before their next job anyway). From
+  80% disk it also removes unused Docker images, volumes and build cache, buildx
+  builders of cancelled jobs, `/tmp` and the package caches in the runner's home (npm,
+  pip, Go, Cargo, Gradle, Maven, NuGet, bun, pnpm). The runner image and the starting
   job's workspace are kept.
 - **When the disk is full** (less than 1 GB free), the disk guard
-  (`gha-runners-diskguard.service`, checks every 15 seconds) deletes the reserve,
+  (`gha-runners-diskguard.service`, checks every 15 seconds) deletes the reserve and
+  the workspaces of idle runners, restarts Docker if the full disk took it down,
   removes unused Docker data and runs `gha-cleanup` in every runner that's between
   jobs. Busy runners are left alone and clean up at their next job. Once there's
   room again, the reserve is set aside again.
@@ -253,6 +255,13 @@ Set `DISK_RESERVE_PERCENT` in `/etc/gha-runners/config.env` to change the reserv
 
 On ZFS, blocks that are only reserved or zero aren't really allocated, so there the
 reserve is written with random data and takes real space in the pool.
+
+**Image store.** Docker 29 and later default to the containerd image store, which keeps
+every image twice (compressed and unpacked): `full-plus` then takes ~22 GB instead of
+~13 GB. New installs use the classic store. `gha-runners doctor` warns if a container
+still uses the containerd store; `gha-runners migrate-storage` switches it. That stops
+the runners, deletes all Docker images and rebuilds the runner image, so the runners
+are offline for one image build.
 
 ## Persistent vs. ephemeral
 
@@ -277,6 +286,7 @@ gha-runners build [--flavor F]          # rebuild the image
 gha-runners limits [--cpus N --memory MB]  # per-runner CPU/RAM caps
 gha-runners doctor                      # storage driver, disk, CPU throttling and OOM kills per runner
 gha-runners prune [--all]               # Docker cleanup (runs hourly; --all removes every unused image now)
+gha-runners migrate-storage             # switch Docker to the classic image store (images stored once)
 gha-runners update                      # pull latest scripts, rebuild, restart
 ```
 

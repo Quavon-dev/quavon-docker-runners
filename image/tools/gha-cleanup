@@ -6,9 +6,10 @@
 #   gha-cleanup --idle        clean up now unless a job is running, including every
 #                             old workspace (the LXC's disk guard runs this when the disk is full)
 #
-# Removes containers earlier jobs left behind, unused Docker images, volumes and
-# build cache, workspaces of other repositories, downloaded actions, /tmp and the
-# package caches in $HOME (npm, pip, Go, Cargo, Gradle, Maven, NuGet ...).
+# Always removes containers earlier jobs left behind and workspaces of other
+# repositories. Above the threshold also unused Docker images, volumes, build
+# cache and buildx builders, /tmp and the package caches in $HOME (npm, pip,
+# Go, Cargo, Gradle, Maven, NuGet ...); when idle also downloaded actions.
 # Never the runner image and never DIR, the workspace of the job that is starting.
 set -uo pipefail
 
@@ -102,14 +103,16 @@ if [[ "$mode" == idle ]]; then
   [[ -e "$job_marker" ]] && { echo "gha-cleanup: a job is running, skipped"; exit 0; }
 fi
 
+# Other repositories' workspaces are wiped before their next job anyway, so
+# keeping them only costs disk. They go on every run.
 remove_leftover_containers
+clean_workspaces
 used="$(used_percent)"
 [[ "$mode" == auto ]] && (( used < CLEANUP_AT_PERCENT )) && exit 0
 
 before="$(free_mb)"
 echo "gha-cleanup: disk ${used}% used, freeing space"
 prune_docker
-clean_workspaces
 clean_caches
 echo "gha-cleanup: freed $(( $(free_mb) - before )) MB, disk now $(used_percent)% used"
 exit 0

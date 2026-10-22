@@ -107,12 +107,12 @@ chk "runner process actually launched (Runner.Listener)" 'grep -qiE "Runner|List
 grep -iE "listening|connected|error|exception" /tmp/runner-journal.log | head -4 | sed 's/^/     /'
 
 section "job hooks"
-docker exec "gha-$name" bash -c "sudo mkdir -p $dir/_work/other && sudo touch $dir/_work/other/root-file"
+docker exec "gha-$name" bash -c "sudo mkdir -p $dir/_work/_temp && sudo touch $dir/_work/_temp/root-file"
 docker run -d --name itest-leftover -v "$dir/_work/t:/w" busybox sleep 600 >/dev/null
 docker run -d --name itest-unrelated -v /tmp:/w busybox sleep 600 >/dev/null
 docker exec -e GITHUB_WORKSPACE="$dir/_work/t" "gha-$name" /opt/gha/hooks/job-started.sh >/dev/null 2>&1
 chk "job-started hook empties workspace" '[[ -z "$(ls -A "$dir/_work/t" 2>/dev/null)" ]]'
-chk "job-started hook hands root-owned files back" '[[ $(stat -c %u:%g "$dir/_work/other/root-file") == 1001:1001 ]]'
+chk "job-started hook hands root-owned files back" '[[ $(stat -c %u:%g "$dir/_work/_temp/root-file") == 1001:1001 ]]'
 chk "job-started hook removes containers left by earlier jobs" '! docker inspect itest-leftover >/dev/null 2>&1'
 chk "job-started hook keeps unrelated containers" 'docker inspect itest-unrelated >/dev/null 2>&1'
 docker rm -f itest-leftover itest-unrelated >/dev/null 2>&1
@@ -120,7 +120,9 @@ docker rm -f itest-leftover itest-unrelated >/dev/null 2>&1
 section "disk cleanup (gha-cleanup in the image)"
 docker exec "gha-$name" bash -c "mkdir -p $dir/_work/old-repo/old-repo $dir/_work/t/t ~/.cache/pip ~/.npm && touch $dir/_work/old-repo/old-repo/f ~/.cache/pip/f ~/.npm/f /tmp/job-junk"
 docker exec -e GITHUB_WORKSPACE="$dir/_work/t/t" "gha-$name" /opt/gha/hooks/job-started.sh >/dev/null 2>&1
-chk "below the threshold nothing extra is removed" '[[ -e $dir/_work/old-repo/old-repo/f ]]'
+chk "other repos' workspaces always removed" '[[ ! -e $dir/_work/old-repo ]]'
+chk "below the threshold caches are kept" 'docker exec "gha-$name" test -e /tmp/job-junk'
+docker exec "gha-$name" bash -c "mkdir -p $dir/_work/old-repo/old-repo && touch $dir/_work/old-repo/old-repo/f"
 chk "job-started marks the runner busy" '[[ -e $dir/.gha-job-running ]]'
 docker exec "gha-$name" /usr/local/bin/gha-cleanup --idle >/tmp/cleanup.log 2>&1
 chk "idle cleanup skips a busy runner" 'grep -q "job is running" /tmp/cleanup.log && [[ -e $dir/_work/old-repo/old-repo/f ]]'
@@ -138,7 +140,7 @@ chk "disk guard running" 'systemctl is-active --quiet gha-runners-diskguard.serv
 for _ in $(seq 1 30); do [[ -s /var/lib/gha-runners/disk-reserve ]] && break; sleep 1; done
 chk "disk reserve set aside" '[[ $(stat -c %s /var/lib/gha-runners/disk-reserve 2>/dev/null || echo 0) -ge 536870912 ]]'
 systemctl stop gha-runners-diskguard.service
-docker exec "gha-$name" bash -c "mkdir -p $dir/_work/old-repo ~/.cache/x && touch ~/.cache/x/f"
+docker exec "gha-$name" bash -c "mkdir -p $dir/_work/old-repo $dir/_work/old-repo2 ~/.cache/x && touch ~/.cache/x/f"
 docker pull -q busybox >/dev/null 2>&1
 docker volume create buildx_buildkit_itest0_state >/dev/null
 docker run -d --name buildx_buildkit_itest0 -v buildx_buildkit_itest0_state:/var/lib/buildkit busybox sleep 600 >/dev/null
@@ -150,6 +152,7 @@ chk "full disk: reserve released" '[[ ! -e /var/lib/gha-runners/disk-reserve ]]'
 chk "full disk: unused images removed" '! docker image inspect busybox >/dev/null 2>&1'
 chk "full disk: leftover buildx builder and its cache removed" '! docker inspect buildx_buildkit_itest0 >/dev/null 2>&1 && ! docker volume inspect buildx_buildkit_itest0_state >/dev/null 2>&1'
 chk "full disk: runner image kept" 'docker image inspect quavon/gha-runner:standard >/dev/null 2>&1'
+chk "full disk: idle runner cleaned without Docker too" '[[ ! -e $dir/_work/old-repo2 ]]'
 chk "full disk: idle runner cleaned by gha-cleanup" '[[ ! -e $dir/_work/old-repo ]] && grep -q "$name: gha-cleanup: freed" /tmp/guard.log'
 gha-runners _diskguard --once >/tmp/guard.log 2>&1
 chk "reserve set aside again once there is room" '[[ -s /var/lib/gha-runners/disk-reserve ]]'
@@ -174,6 +177,8 @@ chk "prune --all succeeds (rc=$rc)" '[[ $rc == 0 ]]'
 chk "prune keeps the runner image with runners stopped" 'docker image inspect quavon/gha-runner:standard >/dev/null 2>&1'
 chk "prune drops unused job images" '! docker image inspect busybox >/dev/null 2>&1'
 chk "prune drops runner images of other flavors" '! docker image inspect quavon/gha-runner:full >/dev/null 2>&1'
+gha-runners migrate-storage </dev/null >/tmp/migrate.log 2>&1; rc=$?
+chk "migrate-storage is a no-op on the classic store (rc=$rc)" '[[ $rc == 0 ]] && grep -q "already uses the classic" /tmp/migrate.log'
 chk "hourly prune service runs" 'systemctl start gha-runners-prune.service'
 if [[ -z "${GH_TEST_TOKEN:-}" ]]; then
   gha-runners remove "$name" </dev/null >/tmp/remove.log 2>&1

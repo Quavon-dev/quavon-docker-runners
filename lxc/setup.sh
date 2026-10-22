@@ -56,7 +56,10 @@ container on LVM-thin or directory storage." ;;
 configure_daemon() {
   local file=/etc/docker/daemon.json cache_cap_gb
   install -d /etc/docker
-  [[ -f "$file" ]] || echo '{ "log-driver": "json-file", "log-opts": { "max-size": "20m", "max-file": "3" } }' >"$file"
+  # Classic image store: the containerd store (Docker 29+ default) keeps
+  # every image twice. Existing installs switch with: gha-runners migrate-storage
+  [[ -f "$file" ]] || echo '{ "log-driver": "json-file", "log-opts": { "max-size": "20m", "max-file": "3" },
+  "features": { "containerd-snapshotter": false } }' >"$file"
   jq -e '.builder.gc' "$file" >/dev/null && return 1
   cache_cap_gb="$(df -BG --output=size / | awk 'NR == 2 { v = int($1 / 4); print (v < 2 ? 2 : v) }')"
   jq --arg cap "${cache_cap_gb}GB" '.builder.gc = { enabled: true, defaultMaxUsedSpace: $cap }' "$file" >"${file}.new" \

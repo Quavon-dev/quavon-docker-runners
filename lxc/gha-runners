@@ -417,6 +417,23 @@ cleanup_idle_runners() {
   done
 }
 
+# Workspaces of runners between jobs, removed without Docker: on a full disk
+# Docker itself may be down. Same lock and busy mark as gha-cleanup.
+clean_idle_workspaces() {
+  local dir ws
+  for dir in "$RUNNERS_ROOT"/*/; do
+    [[ -d "${dir}_work" && ! -e "${dir}.gha-job-running" ]] || continue
+    (
+      exec 9>"${dir}.gha-cleanup.lock"
+      flock -n 9 || exit 0
+      for ws in "${dir}_work"/*; do
+        [[ -d "$ws" && "${ws##*/}" != _* ]] && rm -rf --one-file-system "$ws"
+      done
+      exit 0
+    )
+  done
+}
+
 # Watches the disk. When it's full, releases the reserve so Docker and the
 # cleanup have room to work, removes unused Docker data and cleans every idle
 # runner, then sets the reserve aside again once there's space.
@@ -430,6 +447,8 @@ cmd_diskguard() {
     if (( free < DISK_FULL_FREE_MB )); then
       warn "disk full (${free} MB free): releasing the ${RESERVE_FILE##*/} and cleaning up"
       rm -f "$RESERVE_FILE"
+      clean_idle_workspaces
+      systemctl is-active --quiet docker || { warn "Docker is down: restarting it"; systemctl restart docker || true; }
       prune_unused 0 || true
       cleanup_idle_runners
       info "disk now $(disk_used_percent)% used, $(disk_free_mb) MB free"
@@ -484,6 +503,37 @@ cmd_prune() {
   fi
 }
 
+# Docker 29+ installs default to the containerd image store, which keeps every
+# image twice (compressed and unpacked): ~22 instead of ~13 GB for full-plus.
+storage_is_containerd() {
+  docker info --format '{{.DriverStatus}}' 2>/dev/null | grep -q io.containerd.snapshotter
+}
+
+# Switches Docker to the classic image store (overlay2, one copy per image).
+# Images of the old store are deleted, so the runner image is rebuilt.
+cmd_migrate_storage() {
+  require_root; load_config
+  local file=/etc/docker/daemon.json
+  storage_is_containerd || { ok "Docker already uses the classic image store"; return 0; }
+  if [[ -t 0 ]]; then
+    info "Stops the runners, deletes every Docker image, container and build cache, and rebuilds the runner image."
+    [[ "$(ask "Runners stay offline until the build is done. Continue? (y/N)" n)" =~ ^[Yy] ]] || die "aborted"
+  fi
+  cmd_service stop all
+  info "Deleting the images of the containerd store"
+  docker ps -aq | xargs -r docker rm -f -v >/dev/null
+  docker builder prune --all --force >/dev/null
+  docker images -q | sort -u | xargs -r docker image rm -f >/dev/null
+  docker system prune --all --force --volumes >/dev/null
+  [[ -f "$file" ]] || echo '{}' >"$file"
+  jq '.features["containerd-snapshotter"] = false' "$file" >"${file}.new" && mv "${file}.new" "$file"
+  systemctl restart docker
+  storage_is_containerd && die "Docker still uses the containerd image store (check ${file})"
+  ok "Docker now uses the classic image store: $(df -h --output=avail / | tail -1 | tr -d ' ') free"
+  cmd_build
+  cmd_service start all
+}
+
 cgroup_dir() {
   local pid
   pid="$(docker inspect -f '{{.State.Pid}}' "$1" 2>/dev/null)" || return 1
@@ -523,6 +573,7 @@ cmd_doctor() {
     warn "this driver copies the whole image for every container: move the LXC to ZFS 2.2+, LVM-thin or directory storage"
   fi
   printf 'disk           : %s%% used, %s MB free\n' "$used" "$(disk_free_mb)"
+  storage_is_containerd && warn "containerd image store keeps every image twice: gha-runners migrate-storage"
   printf 'disk reserve   : %s MB of %s MB (%s)\n' "$(reserve_mb)" "$(reserve_target_mb)" "$RESERVE_FILE"
   (( $(reserve_target_mb) == 0 || $(reserve_mb) > 0 )) || warn "disk reserve released: the disk was full recently"
   systemctl is-active --quiet gha-runners-diskguard.service || warn "disk guard not running: systemctl enable --now gha-runners-diskguard"
@@ -570,6 +621,7 @@ gha-runners - Dockerized GitHub Actions runners
   limits [--cpus N] [--memory MB]  show/change per-runner CPU/RAM caps
   doctor                     find what slows the runners down
   prune [--all]              clean up Docker (hourly; --all: every unused image now)
+  migrate-storage            switch Docker to the classic image store (images stored once)
   update                     pull latest scripts, rebuild image, restart all
 EOF
 }
@@ -588,6 +640,7 @@ main() {
     limits) cmd_limits "$@" ;;
     doctor) cmd_doctor ;;
     prune) cmd_prune "$@" ;;
+    migrate-storage) cmd_migrate_storage ;;
     _diskguard) cmd_diskguard "$@" ;;
     _regtoken) cmd_regtoken "$@" ;;
     help|-h|--help) usage ;;
