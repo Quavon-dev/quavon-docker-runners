@@ -444,6 +444,11 @@ declare -A SIZE_PRESETS=(
 
 host_cpus()   { nproc; }
 host_ram_mb() { awk '/MemTotal/ {print int($2 / 1024)}' /proc/meminfo; }
+# 1 when every disk of the host is rotational (no SSD/NVMe to put guests on).
+host_only_hdd() {
+  local rota; rota="$(lsblk -d -n -o ROTA,TYPE 2>/dev/null | awk '$2 == "disk" { print $1 }' | sort -u)"
+  [[ "$rota" == 1 ]]
+}
 
 # How many runners and how they are spread over containers.
 ask_parallel() {
@@ -627,6 +632,17 @@ That works (they are only limits), but parallel heavy jobs could make the
 host swap.
 
 Continue anyway?" 0 || die "Choose a smaller size or fewer runners."
+  fi
+
+  # full images are built from thousands of small files (Go, apt): on a
+  # spinning disk or with little RAM the first build takes much longer.
+  if [[ "$RUNNER_FLAVOR" == full* ]] && { host_only_hdd || (( $(host_ram_mb) < 8000 )); }; then
+    w_yesno "This host has $(host_only_hdd && echo "only spinning disks (HDD)" || echo "only $(( $(host_ram_mb) / 1024 )) GB RAM").
+The first build of the '${RUNNER_FLAVOR}' image (~13-15 GB) can take 1-2 hours
+here and the host stays slow meanwhile. ZFS storage is much faster on HDDs
+than LVM. 'standard' (~3 GB) builds in minutes.
+
+Build '${RUNNER_FLAVOR}' anyway?" 1 || die "Re-run and choose the 'standard' image."
   fi
 
   local total_cpus=$(( CORES * $(ct_count) ))

@@ -61,6 +61,11 @@ jobs:
 | | PowerShell, Chrome + chromedriver, Firefox + geckodriver |
 | | AWS CLI v2, Azure CLI, Google Cloud CLI, ansible, kind |
 
+`full` and `full-plus` are built from thousands of small files. On a host with only
+spinning disks (HDD) or less than 8 GB RAM the first build can take 1-2 hours, so the
+installer asks first. On HDDs, ZFS storage is much faster than LVM-thin: the installer
+turns off sync writes there (see [Sizing](#sizing)).
+
 `full-plus` (~15 GB) is `full` plus a pinned backend/CI toolchain, so workflows don't
 download or `go install` these on every run. Every download is checked against its
 published SHA-256; the Go tools are built with `go install` at the exact tag.
@@ -348,7 +353,7 @@ checkout is copied into the container and nothing is cloned.
 Everything runs in Docker on any machine. No Proxmox host is needed.
 
 ```bash
-tests/run.sh         # shellcheck + unit tests + 23 end-to-end wizard runs
+tests/run.sh         # shellcheck + unit tests + 24 end-to-end wizard runs
 tests/lxc/run.sh     # inside-the-LXC side for real: Docker, systemd units, image build, runner container
 ```
 

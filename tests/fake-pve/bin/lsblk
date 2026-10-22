@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# lsblk -d -n -o ROTA,TYPE: one SSD, or only an HDD with the "hdd" flag.
+source "$(dirname "$0")/_common"
+if flag hdd; then echo "1 disk"; else echo "0 disk"; fi

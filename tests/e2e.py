@@ -500,6 +500,19 @@ def case_full_build_fails_fallback_to_standard():
     check(read(f"{STATE}/destroyed") == "", "container must be kept when falling back")
 
 
+def case_full_image_on_hdd_host_warns():
+    reset_host(flags=["hdd"])
+    c = new_child()
+    answers = [(p, ("\x1b[B" + ENTER) if p == r"Runner image" else k) for p, k in wizard()]   # pick "full"
+    answers.append((r"only spinning disks", "\t" + ENTER))                                   # -> No
+    drive(c, answers, timeout=120)
+    rc = finish(c)
+    out = transcript(c)
+    check(rc != 0, "installer must stop when the warning is declined")
+    check("choose the 'standard' image" in out, "standard image not suggested")
+    check(read(f"{STATE}/ids").strip() == "", "no container may be created")
+
+
 def case_destroy_mentions_registered_runners():
     reset_host()
     c = new_child()
