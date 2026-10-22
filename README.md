@@ -112,6 +112,9 @@ command output goes to `/tmp/gha-runners-install-<date>.log`. If a step fails,
 you get a ✖ plus that step's output. `VERBOSE=1` shows all output live, and
 `DEBUG=1` adds a shell trace in `/tmp/gha-install.log`.
 
+If the SSH or web-console session drops, the installer keeps running in the
+background and writes everything to the log: `tail -f /tmp/gha-runners-install-*.log`.
+
 ## Parallel jobs
 
 A runner executes **one job at a time**. *N* runners means *N* jobs at once, and
@@ -345,7 +348,7 @@ checkout is copied into the container and nothing is cloned.
 Everything runs in Docker on any machine. No Proxmox host is needed.
 
 ```bash
-tests/run.sh         # shellcheck + unit tests + 22 end-to-end wizard runs
+tests/run.sh         # shellcheck + unit tests + 23 end-to-end wizard runs
 tests/lxc/run.sh     # inside-the-LXC side for real: Docker, systemd units, image build, runner container
 ```
 
@@ -355,7 +358,7 @@ tests/lxc/run.sh     # inside-the-LXC side for real: Docker, systemd units, imag
   - the normal path, the `separate` layout with static IPs and VLAN, LAN mode, and ephemeral mode
   - invalid input, runner-name clashes, and a disabled datacenter firewall
   - Docker or AppArmor failures, a leaky firewall, no network, and DHCP handing out the host's IP
-  - Esc and Ctrl+C, a too-small terminal, a hanging `pvesh`, and non-interactive mode
+  - Esc and Ctrl+C, a dropped session during the image build, a too-small terminal, a hanging `pvesh`, and non-interactive mode
 
   They also check that no token ever appears in a command line or the log.
 - **LXC integration** boots Debian 13 with systemd and runs the real `setup.sh`,

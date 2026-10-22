@@ -101,10 +101,11 @@ show_log_tail() {
 run() {
   printf '\n### %s\n' "$*" >>"$LOG_FILE"
   STEP_LOG_LINE="$(wc -l <"$LOG_FILE")"
+  # trap '' HUP: steps (a 40-minute image build) survive a dropped session
   if [[ "$VERBOSE" == 1 ]]; then
-    "$@" </dev/null 2>&1 | tee -a "$LOG_FILE"
+    ( trap '' HUP; "$@" ) </dev/null 2>&1 | tee -a "$LOG_FILE"
   else
-    "$@" </dev/null >>"$LOG_FILE" 2>&1
+    ( trap '' HUP; "$@" ) </dev/null >>"$LOG_FILE" 2>&1
   fi
 }
 
@@ -224,11 +225,24 @@ on_exit() {
   fi
   exit "$rc"
 }
+# A dropped SSH or web-console session (SIGHUP) must not kill a half-done
+# install: carry on with every message going to the log, answer any later
+# prompt with its default, and keep the containers if something fails.
+on_hangup() {
+  [[ "${HUNG_UP:-0}" == 1 ]] && return 0
+  HUNG_UP=1 FANCY=0 NONINTERACTIVE=1
+  [[ -n "$SPINNER_PID" ]] && { kill "$SPINNER_PID" 2>/dev/null || true; SPINNER_PID=""; }
+  exec >>"$LOG_FILE" 2>&1
+  exec {TTY_OUT}>&1 {TTY_ERR}>&2
+  printf '\n### terminal hung up - the installer keeps running, output goes to this log only\n'
+}
+
 trap 'on_error $LINENO' ERR
 trap on_exit EXIT
 # Ctrl+C / kill always ends the installer (on_exit still cleans up). Without
 # this, bash may carry on with the next command after the child was killed.
-trap 'to_terminal; printf "\n"; msg_error "Interrupted"; exit 130' INT TERM HUP
+trap 'to_terminal; printf "\n"; msg_error "Interrupted"; exit 130' INT TERM
+trap on_hangup HUP
 
 # ----------------------------------------------------------------- preflight --
 # Host commands get a timeout: a hung pmxcfs/pvesh must produce an error,
@@ -660,7 +674,7 @@ CT_ENV=(env PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
         LANG=C.UTF-8 LC_ALL=C.UTF-8 LANGUAGE= DEBIAN_FRONTEND=noninteractive)
 ct() {   # ct <ctid> <cmd...>
   local id="$1"; shift
-  pct exec "$id" -- "${CT_ENV[@]}" "$@"
+  ( trap '' HUP; pct exec "$id" -- "${CT_ENV[@]}" "$@" )
 }
 
 # Newest Debian 13 (else 12) standard template FOR THIS HOST'S ARCHITECTURE.

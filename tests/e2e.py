@@ -8,6 +8,7 @@ Run via tests/run.sh, which provides the Docker environment.
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -436,6 +437,20 @@ def case_dhcp_gives_host_ip():
     t = transcript(c)
     check("the address of this Proxmox host" in t, "IP clash with the host not reported")
     check("No network in container" not in t, "IP clash misreported as no network")
+
+
+def case_session_hangup_during_build():
+    # A dropped SSH/web-console session hangs up the whole foreground job.
+    reset_host()
+    c = new_child()
+    drive(c, wizard(), until=r"Building 'standard' image")
+    os.killpg(os.getpgid(c.pid), signal.SIGHUP)
+    rc = finish(c, timeout=200)
+    log = install_log()
+    check(rc == 0, f"installer died on hangup: exit {rc}\n{log[-1500:]}")
+    check("terminal hung up" in log, "hangup not noted in the log")
+    check(os.path.exists(f"{STATE}/ct-100-image"), "image build was killed by the hangup")
+    check("setup.sh start" in calls(), "runners not started after the hangup")
 
 
 def case_noninteractive():
