@@ -177,6 +177,8 @@ chk "prune --all succeeds (rc=$rc)" '[[ $rc == 0 ]]'
 chk "prune keeps the runner image with runners stopped" 'docker image inspect quavon/gha-runner:standard >/dev/null 2>&1'
 chk "prune drops unused job images" '! docker image inspect busybox >/dev/null 2>&1'
 chk "prune drops runner images of other flavors" '! docker image inspect quavon/gha-runner:full >/dev/null 2>&1'
+gha-runners _update_image </dev/null >/tmp/update-image.log 2>&1; rc=$?
+chk "update rebuilds in place on the classic store (rc=$rc)" '[[ $rc == 0 ]] && ! grep -q "switching to the classic" /tmp/update-image.log && grep -q "restart: all" /tmp/update-image.log'
 gha-runners migrate-storage </dev/null >/tmp/migrate.log 2>&1; rc=$?
 chk "migrate-storage is a no-op on the classic store (rc=$rc)" '[[ $rc == 0 ]] && grep -q "already uses the classic" /tmp/migrate.log'
 chk "hourly prune service runs" 'systemctl start gha-runners-prune.service'

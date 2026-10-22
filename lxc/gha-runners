@@ -509,26 +509,50 @@ storage_is_containerd() {
   docker info --format '{{.DriverStatus}}' 2>/dev/null | grep -q io.containerd.snapshotter
 }
 
+# Snapshots and content the containerd store left behind; the classic store
+# never uses them. Leaves first: a snapshot can't go while it has children.
+purge_containerd_leftovers() {
+  command -v ctr >/dev/null || return 0
+  local _ keys parents key
+  ctr -n moby leases ls -q 2>/dev/null | xargs -r -n1 ctr -n moby leases rm >/dev/null 2>&1 || true
+  for _ in $(seq 1 100); do
+    keys="$(ctr -n moby snapshots ls 2>/dev/null | awk 'NR > 1 { print $1 }')"
+    [[ -n "$keys" ]] || break
+    parents="$(ctr -n moby snapshots ls 2>/dev/null | awk 'NR > 1 { print $2 }')"
+    for key in $keys; do
+      grep -qxF "$key" <<<"$parents" || ctr -n moby snapshots rm "$key" >/dev/null 2>&1 || true
+    done
+  done
+  ctr -n moby content ls -q 2>/dev/null | xargs -r ctr -n moby content rm >/dev/null 2>&1 || true
+}
+
 # Switches Docker to the classic image store (overlay2, one copy per image).
 # Images of the old store are deleted, so the runner image is rebuilt.
 cmd_migrate_storage() {
   require_root; load_config
   local file=/etc/docker/daemon.json
-  storage_is_containerd || { ok "Docker already uses the classic image store"; return 0; }
-  if [[ -t 0 ]]; then
+  if ! storage_is_containerd; then
+    purge_containerd_leftovers
+    ok "Docker already uses the classic image store (containerd leftovers: $(du -xsh /var/lib/containerd 2>/dev/null | cut -f1))"
+    return 0
+  fi
+  if [[ -t 0 && "${1:-}" != --yes ]]; then
     info "Stops the runners, deletes every Docker image, container and build cache, and rebuilds the runner image."
     [[ "$(ask "Runners stay offline until the build is done. Continue? (y/N)" n)" =~ ^[Yy] ]] || die "aborted"
   fi
   cmd_service stop all
   info "Deleting the images of the containerd store"
-  docker ps -aq | xargs -r docker rm -f -v >/dev/null
-  docker builder prune --all --force >/dev/null
-  docker images -q | sort -u | xargs -r docker image rm -f >/dev/null
-  docker system prune --all --force --volumes >/dev/null
+  # Best effort: a container whose removal is already in progress, or an
+  # image still in use, must not stop the switch half way.
+  docker ps -aq | xargs -r docker rm -f -v >/dev/null 2>&1 || true
+  docker builder prune --all --force >/dev/null 2>&1 || true
+  docker images -q | sort -u | xargs -r docker image rm -f >/dev/null 2>&1 || true
+  docker system prune --all --force --volumes >/dev/null 2>&1 || true
   [[ -f "$file" ]] || echo '{}' >"$file"
   jq '.features["containerd-snapshotter"] = false' "$file" >"${file}.new" && mv "${file}.new" "$file"
   systemctl restart docker
   storage_is_containerd && die "Docker still uses the containerd image store (check ${file})"
+  purge_containerd_leftovers
   ok "Docker now uses the classic image store: $(df -h --output=avail / | tail -1 | tr -d ' ') free"
   cmd_build
   cmd_service start all
@@ -603,6 +627,20 @@ cmd_update() {
   info "Updating ${REPO_DIR}"
   git -C "$REPO_DIR" pull --ff-only
   bash "${REPO_DIR}/lxc/setup.sh" files
+  # Continue in the CLI just installed, so this update already runs new code.
+  exec /usr/local/bin/gha-runners _update_image
+}
+
+# The second half of `update`. The containerd image store keeps every image
+# twice, so an old + new image wouldn't fit next to each other: switch the
+# store first (which builds the image once), otherwise just rebuild.
+cmd_update_image() {
+  require_root; load_config
+  if storage_is_containerd; then
+    info "Docker uses the containerd image store: switching to the classic store first"
+    cmd_migrate_storage --yes
+    return
+  fi
   cmd_build
   cmd_service restart all
 }
@@ -640,7 +678,8 @@ main() {
     limits) cmd_limits "$@" ;;
     doctor) cmd_doctor ;;
     prune) cmd_prune "$@" ;;
-    migrate-storage) cmd_migrate_storage ;;
+    migrate-storage) cmd_migrate_storage "$@" ;;
+    _update_image) cmd_update_image ;;
     _diskguard) cmd_diskguard "$@" ;;
     _regtoken) cmd_regtoken "$@" ;;
     help|-h|--help) usage ;;
