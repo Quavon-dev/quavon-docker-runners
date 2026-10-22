@@ -152,6 +152,11 @@ effectively have root there.
 | DNS via [DNS.SB](https://dns.sb/) (`185.222.222.222` / `45.11.45.11`), kept even when DHCP hands out a LAN resolver | a LAN resolver isn't needed |
 | `ACCEPT` to `LAN_ALLOW` entries | opt-in exceptions, e.g. an internal registry or GitHub Enterprise Server |
 
+If DHCP hands a container the Proxmox host's own address (the host has a static IP
+inside the router's DHCP range), the installer stops that container at once and tells
+you to reserve the address in the router or use static IPs. Otherwise both answer on
+the same IP and SSH to the host drops.
+
 The installer checks that this works: `github.com` must be reachable, and the
 Proxmox web UI (`:8006`) and the gateway must not be. If either check fails, it aborts.
 
@@ -340,7 +345,7 @@ checkout is copied into the container and nothing is cloned.
 Everything runs in Docker on any machine. No Proxmox host is needed.
 
 ```bash
-tests/run.sh         # shellcheck + unit tests + 21 end-to-end wizard runs
+tests/run.sh         # shellcheck + unit tests + 22 end-to-end wizard runs
 tests/lxc/run.sh     # inside-the-LXC side for real: Docker, systemd units, image build, runner container
 ```
 
@@ -349,7 +354,7 @@ tests/lxc/run.sh     # inside-the-LXC side for real: Docker, systemd units, imag
   pseudo-terminal. They cover:
   - the normal path, the `separate` layout with static IPs and VLAN, LAN mode, and ephemeral mode
   - invalid input, runner-name clashes, and a disabled datacenter firewall
-  - Docker or AppArmor failures, a leaky firewall, and no network
+  - Docker or AppArmor failures, a leaky firewall, no network, and DHCP handing out the host's IP
   - Esc and Ctrl+C, a too-small terminal, a hanging `pvesh`, and non-interactive mode
 
   They also check that no token ever appears in a command line or the log.

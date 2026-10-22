@@ -428,6 +428,16 @@ def case_no_network():
     check("No network in container 100" in transcript(c), "no-network not reported")
 
 
+def case_dhcp_gives_host_ip():
+    reset_host(flags=["ip-clash"])
+    c = new_child()
+    drive(c, wizard() + [(r"Destroy the container", ENTER)], timeout=200)
+    finish(c)
+    t = transcript(c)
+    check("the address of this Proxmox host" in t, "IP clash with the host not reported")
+    check("No network in container" not in t, "IP clash misreported as no network")
+
+
 def case_noninteractive():
     reset_host()
     r = subprocess.run(["bash", "-c", open(f"{ROOT}/install.sh").read()], cwd="/tmp", capture_output=True, text=True,

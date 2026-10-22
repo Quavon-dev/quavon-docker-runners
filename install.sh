@@ -859,6 +859,43 @@ check_isolation() {
   ISO_SUMMARY="github.com reachable; host ${host_ip:-?} and gateway ${gw:-?} blocked"
 }
 
+# Why "no network": no DHCP lease, no route, or DNS unreachable. Details into
+# the log, the verdict on screen. Never aborts the installer itself.
+network_diagnostics() {
+  ( set +e +o pipefail; trap - ERR; collect_network_diagnostics ) || true
+}
+
+collect_network_diagnostics() {
+  {
+    echo "=== network diagnostics for CT ${CTID}"
+    echo "--- host: net0"; grep -E '^net0' "/etc/pve/lxc/${CTID}.conf" 2>&1
+    echo "--- host: firewall rules for veth${CTID}i0: $(iptables-save 2>/dev/null | grep -c "veth${CTID}i0")"
+    echo "--- ct: addresses / routes / resolver"
+    ct "$CTID" ip -br addr 2>&1
+    ct "$CTID" ip route 2>&1
+    ct "$CTID" cat /etc/resolv.conf 2>&1
+    echo "--- ct: DHCP client log"
+    ct "$CTID" journalctl -b --no-pager -n 30 -u systemd-networkd -u networking -u ifupdown-pre 2>&1 | tail -30
+    echo "--- ct: getent hosts github.com"; ct "$CTID" timeout 5 getent hosts github.com 2>&1
+  } >>"$LOG_FILE" 2>&1
+
+  local ip gw dns
+  ip="$(ct "$CTID" ip -4 -o addr show dev eth0 2>/dev/null | awk '{print $4}' | head -1)"
+  gw="$(ct "$CTID" ip -4 route show default 2>/dev/null | awk '{print $3}' | head -1)"
+  dns="$(echo "$DNS_SERVERS" | awk '{print $1}')"
+  if [[ -z "$ip" ]]; then
+    msg_warn "eth0 got no IPv4 address: the DHCP server didn't answer. If the router's DHCP range"
+    msg_warn "is full (every test install leaves a lease behind), delete old 'gha-runners' leases"
+    msg_warn "in the router, or use static IPs (Container settings: advanced)."
+  elif [[ -z "$gw" ]]; then
+    msg_warn "eth0 has ${ip} but no default route: DHCP sent no gateway."
+  elif ! ct "$CTID" timeout 5 bash -c "</dev/tcp/${dns}/53" 2>/dev/null; then
+    msg_warn "eth0 has ${ip} via ${gw}, but DNS server ${dns} isn't reachable (port 53): is outbound DNS blocked?"
+  else
+    msg_warn "eth0 has ${ip} via ${gw} and ${dns} is reachable, but github.com doesn't resolve."
+  fi
+}
+
 # Everything needed to understand a failed isolation check, into the log,
 # plus a short on-screen summary. Runs tolerant: a missing tool or an empty
 # grep must never abort the installer.
@@ -939,9 +976,18 @@ Nothing has been installed in the container yet." retry \
   done
 }
 
+# rc 2: DHCP handed out an address the Proxmox host already uses (the host
+# has a static IP inside the router's DHCP range). Both then answer on that
+# address and SSH to the host breaks, so the container is stopped at once.
 wait_network() {
-  local _
+  local _ ip
   for _ in $(seq 1 60); do
+    ip="$(ct "$CTID" hostname -I 2>/dev/null | awk '{print $1}')"
+    if [[ -n "$ip" ]] && hostname -I | tr ' ' '\n' | grep -qxF "$ip"; then
+      pct stop "$CTID" >/dev/null 2>&1 || true
+      CT_IP_CLASH="$ip"
+      return 2
+    fi
     ct "$CTID" getent hosts github.com >/dev/null 2>&1 && return 0
     sleep 2
   done
@@ -961,7 +1007,17 @@ start_ct() {
   step "Starting container ${CTID}" "Started container ${CTID}" -- pct start "$CTID"
   [[ "$NET_ISOLATION" == internet ]] && step "Pinning public DNS (${DNS_SERVERS})" "DNS pinned to ${DNS_SERVERS}" -- pin_dns
   msg_info "Waiting for network (DHCP + DNS)"
-  wait_network || { msg_error "No network in container ${CTID}"; die "Check bridge, DHCP and VLAN."; }
+  local rc=0
+  wait_network || rc=$?
+  if (( rc == 2 )); then
+    msg_error "Container ${CTID} got ${CT_IP_CLASH} from DHCP - the address of this Proxmox host"
+    die "Your router's DHCP range includes the host's static IP. Reserve ${CT_IP_CLASH} for the host in the router (or move the host's IP out of the DHCP range), or give the runners static IPs (advanced settings)."
+  fi
+  if (( rc != 0 )); then
+    msg_error "No network in container ${CTID}"
+    network_diagnostics
+    die "Check bridge, DHCP and VLAN. Details: ${LOG_FILE}"
+  fi
   msg_ok "Network up: $(ct "$CTID" hostname -I | awk '{print $1}')"
 }
 

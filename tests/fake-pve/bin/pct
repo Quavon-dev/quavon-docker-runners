@@ -32,7 +32,7 @@ case "$cmd" in
       *"_ "*" 8006"*) flag leaky-firewall && exit 0; exit 1 ;;
       *"_ "*" 80"*) exit 1 ;;
       *"route show default"*) echo "default via 192.168.1.1 dev eth0 proto dhcp" ;;
-      *"hostname -I"*) echo "192.168.1.$((id % 200 + 20)) " ;;
+      *"hostname -I"*) if flag ip-clash; then hostname -I; else echo "192.168.1.$((id % 200 + 20)) "; fi ;;
       "getent hosts github.com") flag no-network && exit 2; echo "140.82.121.4 github.com" ;;
       *apt-get*) for p in ca-certificates curl git; do echo "Get:1 http://deb.debian.org/debian trixie/main amd64 $p"; sleep 0.2; echo "Setting up $p ..."; done ;;
       *"git clone"*) echo "Cloning into '/opt/quavon-docker-runners'..." ;;
